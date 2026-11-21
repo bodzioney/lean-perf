@@ -1,0 +1,10 @@
+name = "leanperf"
+version = "0.1.0"
+defaultTargets = ["leanperf-parser"]
+
+[[lean_exe]]
+name = "leanperf-parser"
+root = "LeanPerf"
+
+[[lean_lib]]
+name = "LeanPerf.Grammar"
