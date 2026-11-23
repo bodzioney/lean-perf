@@ -820,6 +820,34 @@ private unsafe def answer (slot : Build.Slot) (w : Workspace) (m : Name) (req : 
       IO.FS.rename tmp resultFile
     return toJson (← projectReport w m dir (← Build.readJson (dir / "decls.json")) r)
 
+/-- Batch callers consume files in source order and can ask for a check immediately after each
+    report. Keep at most one in-flight report per slot and reuse the just-finished worker to check
+    the edited text in its initialized import environment. -/
+private structure ReplayWindow where
+  remaining : List Name
+  idle : List Build.Slot
+  pending : Std.HashMap Name (Build.Slot × Task (Except IO.Error Json)) := {}
+
+private unsafe def replayAnswer (state : IO.Ref ReplayWindow) (fallback : Build.Slot)
+    (w : Workspace) (m : Name) (req config : Json) : IO Json := do
+  let mut q ← state.get
+  if (req.getObjValAs? Bool "check").toOption.getD false then
+    return ← answer (q.idle.headD fallback) w m req
+  while let slot :: slots := q.idle do
+    let next :: rest := q.remaining | break
+    let task ← BaseIO.asTask ((answer slot w next config).toBaseIO) .dedicated
+    q := { remaining := rest, idle := slots, pending := q.pending.insert next (slot, task) }
+  state.set q
+  let some (slot, task) := q.pending[m]? | return ← answer fallback w m req
+  let result ← IO.wait task
+  state.set { q with idle := slot :: q.idle, pending := q.pending.erase m }
+  -- A snapshot can change between planning and a request. Reuse a prefetched report only for
+  -- the exact source it analyzed. The ordinary path handles a new buffer or a changed file.
+  let job := w.plan.jobs[m]!
+  let text ← (req.getObjValAs? String "text").toOption.getDM (IO.FS.readFile job.source)
+  if hash text != job.sourceHash then return ← answer slot w m (req.setObjVal! "text" text)
+  IO.ofExcept result
+
 end LeanPerf.Dedup
 
 open LeanPerf LeanPerf.Dedup in
@@ -864,7 +892,7 @@ Run from the target Lake project. Reports checked proof terms and their location
   let mut files : Array System.FilePath := #[]
   let mut workers := (← IO.getEnv "LEANPERF_JOBS").getD "2"
   for a in rest do
-    if ["--serve", "--build-only", "--shorter", "--tactics", "--compress"].contains a then continue
+    if ["--serve", "--batch-replay", "--build-only", "--shorter", "--tactics", "--compress"].contains a then continue
     if let some n := a.dropPrefix? "--min-saving=" then
       minSaving := (n.toString.toNat?.getD 1) * 1000
       continue
@@ -918,22 +946,28 @@ Run from the target Lake project. Reports checked proof terms and their location
     return 0
   let stdin ← IO.getStdin
   let stdout ← IO.getStdout
-  repeat
-    let line ← stdin.getLine
-    if line.isEmpty then break
-    let reply ← try
-      let req ← IO.ofExcept (Json.parse line)
-      let path ← IO.FS.realPath (← IO.ofExcept (req.getObjValAs? String "path"))
-      let m := Build.moduleOf root path
-      unless world.plan.jobs.contains m do
-        files := files.push path
-        world ← prepare root cache files options jobs tactics
-      let req := if tactics && !(req.getObjValAs? Bool "check").toOption.getD false then
-        req.mergeObj tacticConfig
-        else req
-      answer slot world m req
-    catch e => pure (Json.mkObj [("error", toString e)])
-    stdout.putStrLn reply.compress
-    stdout.flush
-  Build.stop slot
+  let parallel := rest.contains "--batch-replay" && tactics && files.size > 1 && jobs > 1
+  let slots ← (List.range (if parallel then min jobs files.size else 0)).mapM fun _ => IO.mkRef none
+  let window ← IO.mkRef { remaining := files.toList.map (Build.moduleOf root), idle := slots : ReplayWindow }
+  try
+    repeat
+      let line ← stdin.getLine
+      if line.isEmpty then break
+      let reply ← try
+        let req ← IO.ofExcept (Json.parse line)
+        let path ← IO.FS.realPath (← IO.ofExcept (req.getObjValAs? String "path"))
+        let m := Build.moduleOf root path
+        unless world.plan.jobs.contains m do
+          files := files.push path
+          world ← prepare root cache files options jobs tactics
+        let req := if tactics && !(req.getObjValAs? Bool "check").toOption.getD false then
+          req.mergeObj tacticConfig
+          else req
+        if parallel then replayAnswer window slot world m req tacticConfig else answer slot world m req
+      catch e => pure (Json.mkObj [("error", toString e)])
+      stdout.putStrLn reply.compress
+      stdout.flush
+  finally
+    for (_, (_, t)) in (← window.get).pending do discard <| IO.wait t
+    for s in slot :: slots do Build.stop s
   return 0

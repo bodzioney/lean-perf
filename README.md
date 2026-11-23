@@ -104,7 +104,7 @@ A candidate must leave the same goals on every replay, introduce no errors or `s
 ~/Code/lean-perf/.lake/build/bin/leanperf --tactics --check --apply src/Example.lean
 ```
 
-The tactic pass builds skeletons only for project modules imported by another target or dependency. External imports must already have compatible `.olean` files. It caches successful replay results under `.lake/leanperf/tactics`, keyed by the source, dependencies, build settings, LeanPerf executable, `--min-saving` and `--shorter`. `--check` elaborates the edited module even on a cache hit. Set `LEANPERF_CACHE_DIR` to choose another cache directory.
+The tactic pass builds skeletons only for project modules imported by another target or dependency. External imports must already have compatible `.olean` files. Batch replay analyzes up to `--jobs N` files concurrently (default 2) and emits edits in path order. It caches successful reports under `.lake/leanperf/tactics`, keyed by the source, dependencies, build settings, LeanPerf executable, saving threshold and compression options. `--check` elaborates the edited module even on a cache hit. Set `LEANPERF_CACHE_DIR` to choose another cache directory.
 
 Heartbeats measure elaboration. Use `--bench` to measure wall time including kernel checking. `--min-saving N` (default 1) skips edits that save fewer than `N` heartbeats.
 

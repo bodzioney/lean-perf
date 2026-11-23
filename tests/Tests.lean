@@ -491,6 +491,32 @@ def arithmeticPremises : IO Unit := withFixture fun r => do
   let shorter ← run (args.push "--shorter") r
   ok shorter; hasOut shorter ": P ∨ False := by linarith\n"
 
+def parallelReplays : IO Unit := withFixture fun r => do
+  let write (name peer : String) := do
+    let path := r / "Fixture" / (name ++ ".lean")
+    IO.FS.writeFile path ("import Lean\nrun_cmd do\n" ++
+      s!"  IO.FS.writeFile {name.quote} \"\"\n" ++
+      s!"  for _ in [:250] do\n    if ← System.FilePath.pathExists {peer.quote} then break\n    IO.sleep 20\n" ++
+      s!"  unless ← System.FilePath.pathExists {peer.quote} do throwError \"missing concurrent replay\"\n" ++
+      "set_option maxHeartbeats 500000 in\nexample : True := True.intro\n")
+    return path
+  let a ← write "First" "Second"
+  let b ← write "Second" "First"
+  let c := r / "Fixture" / "Third.lean"
+  IO.FS.writeFile c "set_option maxHeartbeats 600000 in\nexample : True := True.intro\n"
+  let args := #["--tactics", "--check", c.toString, b.toString, a.toString]
+  let cold ← run (args ++ #["--jobs", "2"]) r
+  ok cold; hasErr cold "3 edits"
+  let warm ← run (args ++ #["--jobs", "1"]) r
+  ok warm; check (cold.out == warm.out) warm.out
+  -- An unsaved buffer can differ from the saved snapshot being analyzed by a worker.
+  let req := Json.mkObj [("path", toJson a.toString), ("text", toJson "example : False := True.intro\n")]
+  let buffer ← run #["--project", "--serve", "--batch-replay", "--tactics", "--jobs=2",
+    a.toString, b.toString] r (some (req.compress ++ "\n"))
+  ok buffer
+  let reply ← IO.ofExcept (Json.parse buffer.out)
+  check ((reply.getObjValAs? Nat "elabErrors").toOption.any (· > 0)) buffer.out
+
 def explicitArithmeticPremises : IO Unit := withFixture fun r => do
   let path := r / "Fixture" / "Explicit.lean"
   let commented := "example : Picked (3, 4) := by nlinarith [picked /- keep -/ (3, 4)]\n"
@@ -570,7 +596,8 @@ def tests : List (String × IO Unit) := [
   ("check rejects a wrong proof", checkRejectsWrongProof), ("checked apply with a build", checkedApplyWithBuild),
   ("language server, syntax pass", lspSyntax), ("language server, elaborated pass", lspElaborated),
   ("cheaper tactics", tactics), ("tactic cache and dependency skeletons", tacticCache),
-  ("arithmetic premise selection", arithmeticPremises), ("explicit arithmetic premises", explicitArithmeticPremises),
+  ("parallel tactic replay", parallelReplays), ("arithmetic premise selection", arithmeticPremises),
+  ("explicit arithmetic premises", explicitArithmeticPremises),
   ("proof compression", proofCompression),
   ("maximum nonoverlapping savings", overlappingSavings), ("signature compression", signatureCompression),
   ("local relation chains", relationChains)]

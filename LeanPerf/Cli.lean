@@ -129,7 +129,7 @@ def elaboratedAnalyzer (root : FilePath) (paths : Array FilePath) (general := tr
   h.putStr (toJson (paths.map (·.toString))).compress
   h.flush
   let args := #["--project", "--serve"] ++ (if general then #[] else #["--no-general"]) ++
-    (tacticSaving.map (fun n => #["--tactics", s!"--min-saving={n}"])).getD #[] ++
+    (tacticSaving.map (fun n => #["--tactics", "--batch-replay", s!"--min-saving={n}"])).getD #[] ++
     (if shorter then #["--shorter"] else #[]) ++
     (if compress then #["--compress"] else #[]) ++
     (jobs.map (#[s!"--jobs={·}"])).getD #[] ++ #[s!"--file-list={listing}"]
@@ -425,7 +425,7 @@ A Lean proof linter, batch rewriter and LSP server.
                    `set_option … in` overrides a command does not need (elaborates the target)
   --min-saving N   with --tactics, the smallest saving worth an edit, in heartbeats (default 1)
   --compress       replace tactic proofs with shorter local or library proofs; implies --tactics --shorter --check
-  --jobs N         parallel elaborated skeleton workers (default 2)
+  --jobs N         parallel workers for skeletons and batch tactic replay (default 2)
   --shorter        select only replacements that shrink the source in UTF-8
 "
 
