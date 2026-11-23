@@ -1,4 +1,5 @@
 import LeanPerf.Rules
+import LeanPerf.Lints
 import LeanPerf.SyntaxDedup
 import LeanPerf.Project
 import Std.Sync.Channel
@@ -22,11 +23,8 @@ open Lean System
 namespace LeanPerf.Cli
 
 /-- Rule name, description, and a token whose absence means the rule cannot fire. -/
-def ruleTable : List (String × String × String) := [
-  ("splitObtain", "Bind the application before destructuring it", "obtain"),
-  ("exactUsing", "Use the hypothesis whose type matches the goal", "simpa"),
-  ("simpRfl", "Use reflexivity for this equality", "simp"),
-  ("rflTerm", "Use the reflexivity proof term directly", "rfl")]
+def ruleTable : List (String × String × String) :=
+  (Lints.catalog.filter (·.group == "syntax")).map fun l => (l.name, l.description, l.token)
 def ruleNames : List String := ruleTable.map (·.1)
 def ruleMessage (r : String) : String := ((ruleTable.find? (·.1 == r)).map (·.2.1)).getD r
 def dedupModes : List String := ["auto", "syntax", "elaborate"]
@@ -122,13 +120,15 @@ def syntaxAnalyzer (root : FilePath) (paths : Array FilePath) : IO Analyzer := d
 
 /-- This executable under `lake env` in the target project, answering one JSON request per line. -/
 def elaboratedAnalyzer (root : FilePath) (paths : Array FilePath) (general := true)
-    (jobs : Option Nat := none) (tacticSaving : Option Nat := none) (shorter compress := false) : IO Analyzer := do
+    (jobs : Option Nat := none) (tacticSaving : Option Nat := none) (shorter compress := false)
+    (disabled : List String := []) : IO Analyzer := do
   if let some r ← toolchainMismatch root then
     throw <| IO.userError s!"cannot elaborate the project: {r}"
   let (h, listing) ← IO.FS.createTempFile
   h.putStr (toJson (paths.map (·.toString))).compress
   h.flush
   let args := #["--project", "--serve"] ++ (if general then #[] else #["--no-general"]) ++
+    (disabled.map ("--skip-lint=" ++ ·)).toArray ++
     (tacticSaving.map (fun n => #["--tactics", "--batch-replay", s!"--min-saving={n}"])).getD #[] ++
     (if shorter then #["--shorter"] else #[]) ++
     (if compress then #["--compress"] else #[]) ++
@@ -165,14 +165,16 @@ def elaboratedAnalyzer (root : FilePath) (paths : Array FilePath) (general := tr
 
 /-- The elaborated pass when the dependencies are built, else the syntactic pass. -/
 def dedupAnalyzer (root : FilePath) (paths : Array FilePath) (mode : String)
-    (jobs : Option Nat := none) : IO Analyzer := do
+    (jobs : Option Nat := none) (rules := Lints.names "dedup") : IO Analyzer := do
   let root ← IO.FS.realPath root
   let mut mode := mode
   if mode == "auto" then
     let reason ← elaborationBlocker root paths
     if let some r := reason then IO.eprintln s!"LeanPerf dedup: {r}; using the syntactic pass"
     mode := if reason.isSome then "syntax" else "elaborate"
-  if mode == "syntax" then syntaxAnalyzer root paths else elaboratedAnalyzer root paths (jobs := jobs)
+  if mode == "syntax" then syntaxAnalyzer root paths else
+    elaboratedAnalyzer root paths (general := rules.contains "specialCase") (jobs := jobs)
+      (disabled := ["duplicate"].filter (!rules.contains ·))
 
 def ruleAnalyzer (env : Environment) (rules : List String) : Analyzer where
   analyze _ text? := do
@@ -414,7 +416,9 @@ A Lean proof linter, batch rewriter and LSP server.
 
   paths            Lean files or directories
   --lsp            serve LSP over stdio
-  --rules R,…      comma-separated syntax rules: splitObtain, exactUsing, simpRfl, rflTerm
+  --list-lints     show the lint names, modes and descriptions
+  --rules R,…      enable only these lints within the chosen mode
+  -A, --allow R,…  suppress these lints within the chosen mode
   --apply          apply fixes in place
   --check          also elaborate rewritten files before writing them
   --bench N        time N original and N rewritten Lake checks
@@ -431,6 +435,8 @@ A Lean proof linter, batch rewriter and LSP server.
 
 def parseArgs (argv : List String) : Except String Args := do
   let mut a : Args := {}
+  let mut selected : Option (List String) := none
+  let mut allowed := []
   let mut rest := argv
   let value (flag : String) (rest : List String) : Except String (String × List String) :=
     match rest with
@@ -451,7 +457,8 @@ def parseArgs (argv : List String) : Except String Args := do
     | "--shorter" => a := { a with shorter := true }
     | "--tactics" => a := { a with tactics := true }
     | "--compress" => a := { a with tactics := true, shorter := true, check := true, compress := true }
-    | "--rules" => let (v, r) ← take; rest := r; a := { a with rules := v.splitOn "," }
+    | "--rules" => let (v, r) ← take; rest := r; selected := some (v.splitOn ",")
+    | "--allow" | "-A" => let (v, r) ← take; rest := r; allowed := allowed ++ v.splitOn ","
     | "--bench" =>
       let (v, r) ← take; rest := r
       let some n := v.toNat? | throw "argument --bench: invalid int value"
@@ -481,9 +488,16 @@ def parseArgs (argv : List String) : Except String Args := do
       !(a.lsp || a.paths.size > 0) then
     throw "select --lsp alone or supply Lean paths with batch options"
   if a.dedup && a.tactics then throw "--dedup and --tactics are separate passes"
-  unless a.rules.all ruleNames.contains do
-    throw s!"expected an array containing rule names from {", ".intercalate ruleNames}"
-  return a
+  let available := if a.dedup then match a.dedupPass with
+      | some "syntax" => ["syntacticDuplicate"]
+      | some "elaborate" => ["duplicate", "specialCase"]
+      | _ => Lints.names "dedup"
+    else if a.tactics then Lints.names "tactics" ++ (if a.compress then Lints.names "compress" else [])
+    else ruleNames
+  let wanted := selected.getD available
+  unless (wanted ++ allowed).all available.contains do
+    throw s!"available lints in this mode: {", ".intercalate available}"
+  return { a with rules := available.filter fun r => wanted.contains r && !allowed.contains r }
 
 def label (path : FilePath) : IO String := do
   let cwd := (← IO.currentDir).toString ++ "/"
@@ -502,6 +516,7 @@ def runBatch (paths : Array FilePath) (args : Args) (an : Analyzer)
       let original ← IO.FS.readBinFile path
       let some text := String.fromUTF8? original | throw <| IO.userError "not UTF-8"
       let r ← an.analyze path (some text)
+      let r := { r with findings := r.findings.filter (args.rules.contains ·.rule) }
       skipped := skipped + r.skipped
       for f in r.findings do
         if let (some msg, some rg) := (f.message, f.range) then
@@ -800,6 +815,9 @@ def runServer (env : Environment) (rules : List String) : IO UInt32 := do
 /-! ## Entry point -/
 
 unsafe def run (argv : List String) : IO UInt32 := do
+  if argv == ["--list-lints"] then
+    for lint in Lints.catalog do IO.println s!"{lint.name}\t{lint.group}\t{lint.description}"
+    return 0
   let args ← match parseArgs argv with
     | .ok a => pure a
     | .error "help" => IO.print usage; return 0
@@ -811,7 +829,8 @@ unsafe def run (argv : List String) : IO UInt32 := do
       let an ← if args.tactics then
           elaboratedAnalyzer root paths (jobs := args.jobs)
             (tacticSaving := args.minSaving) (shorter := args.shorter) (compress := args.compress)
-        else dedupAnalyzer root paths (args.dedupPass.getD "auto") args.jobs
+            (disabled := (Lints.names "tactics" ++ Lints.names "compress").filter (!args.rules.contains ·))
+        else dedupAnalyzer root paths (args.dedupPass.getD "auto") args.jobs args.rules
       try runBatch paths args an (skeletonVerify an) finally an.close
     else
       let env ← grammarEnv

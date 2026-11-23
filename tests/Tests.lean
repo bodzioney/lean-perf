@@ -596,6 +596,62 @@ def pruneHaves : IO Unit := withFixture fun r => do
   check (!has text "unnecessary" && has text "have needed" && has text "have annotated") text
   ok (← sh "lake" #["env", "lean", path.toString] r)
 
+def matchingTypes : IO Unit := withFixture fun r => do
+  let path := r / "Fixture" / "Search.lean"
+  let negative := "theorem mismatch (n m : Nat) (a : Token n) (b : Grant m) : Reward := fallback n m a b\n"
+  IO.FS.writeFile path ("axiom Token : Nat → Prop\naxiom Both : Nat → Nat → Prop\naxiom Won : Prop\n" ++
+    "axiom Finished : Prop\naxiom Reward : Prop\naxiom win (n : Nat) : Token n → Won\n" ++
+    "axiom doneWith (a b : Nat) : Both a b → Finished\n" ++
+    "theorem original (a b : Nat) (h : Token a) : Won := win a h\n" ++
+    "theorem swapped (b a : Nat) (w : Token a) : Won := win a w\n" ++
+    "theorem paired (a b c : Nat) (h : Both a b) : Finished := doneWith a b h\n" ++
+    "theorem swapPair (c b a : Nat) (h : Both a b) : Finished := doneWith a b h\n" ++
+    "axiom Grant : Nat → Prop\naxiom getReward (n : Nat) : Token n → Grant n → Reward\n" ++
+    "theorem grant (n : Nat) (h : Token n) (k : Grant n) : Reward := getReward n h k\n" ++
+    "theorem joined (m : Nat) (w : Token m ∧ Grant m) : Reward := getReward _ w.1 w.2\n" ++
+    "theorem ambiguous (n m : Nat) (ok : Token n) (permit : Grant n) (decoy : Token m) : Reward := getReward _ ok permit\n" ++
+    "axiom fallback (n m : Nat) : Token n → Grant m → Reward\n" ++ negative)
+  let o ← run #["--dedup-pass", "elaborate", "--check", "--apply", path.toString] r
+  ok o; hasErr o "4 edits"; hasErr o "swapped restates (with arguments reordered) original"
+  hasErr o "swapPair restates (with arguments reordered) paired"
+  hasErr o "joined is a special case of grant"; hasErr o "ambiguous is a special case of grant"
+  check (has (← IO.FS.readFile path) negative) "mismatched indices were accepted"
+  ok (← sh "lake" #["env", "lean", path.toString] r)
+
+def lintSelection : IO Unit := withFixture fun r => do
+  let list ← run #["--list-lints"] r
+  ok list; hasOut list "specialCase\tdedup\t"; hasOut list "unusedHave\tcompress\t"
+  let path := r / "Fixture" / "Use.lean"
+  let args := #["--dedup-pass", "elaborate", "--check", path.toString]
+  let exact ← run (args ++ #["--rules", "duplicate"]) r
+  ok exact; hasErr exact "duplicate:"; checkNot (has exact.err "specialCase:") exact.err
+  let general ← run (args ++ #["-A", "duplicate"]) r
+  ok general; hasErr general "specialCase:"; checkNot (has general.err "duplicate:") general.err
+  let invalid ← run (args ++ #["--rules", "unusedHave"]) r
+  check (invalid.code == 2) invalid.err
+  let p := r / "Fixture" / "Named.lean"
+  IO.FS.writeFile p ("theorem named : @Eq.{1} Nat 1 1 := by\n" ++
+    "  have unused : True := True.intro\n  rfl\n")
+  let pruning ← run #["--compress", "--rules", "unusedHave", "--apply", p.toString] r
+  ok pruning; hasErr pruning "unusedHave:"
+  check ((← IO.FS.readFile p) == "theorem named : @Eq.{1} Nat 1 1 := by\n  rfl\n") pruning.err
+
+def permutedStatements : IO Unit := withFixture fun r => do
+  let permutations (items : List String) := items.foldl (init := [[]]) fun ps x =>
+    ps.flatMap fun p => (List.range (p.length + 1)).map fun i => p.take i ++ x :: p.drop i
+  let facts := (permutations ["(h : E a b)", "(i : E b c)", "(j : E c d)"]).toArray
+  let mut text := "axiom E : Nat → Nat → Prop\naxiom Target : Prop\naxiom witness : Target\n"
+  for (order, n) in (permutations ["a", "b", "c", "d"]).zipIdx do
+    text := text ++ s!"theorem path{n} ({" ".intercalate order} : Nat) " ++
+      " ".intercalate facts[n % facts.size]! ++ " : Target := witness\n"
+  let star := "theorem star (a b c d : Nat) (h : E a b) (i : E a c) (j : E a d) : Target := witness\n"
+  let p := r / "Fixture" / "Permutations.lean"
+  IO.FS.writeFile p (text ++ star)
+  let o ← run #["--dedup-pass", "elaborate", "--rules", "duplicate", "--check", "--apply", p.toString] r
+  ok o; hasErr o "23 edits"
+  check (has (← IO.FS.readFile p) star) "a star graph matched a directed path"
+  ok (← sh "lake" #["env", "lean", p.toString] r)
+
 def tests : List (String × IO Unit) := [
   ("checked preview", checkedPreview), ("static apply never loads the project", staticApplyNeverLoadsTheProject),
   ("reflexivity term", reflexivityTerm), ("failed check preserves source", failedCheckPreservesSource),
@@ -613,7 +669,9 @@ def tests : List (String × IO Unit) := [
   ("explicit arithmetic premises", explicitArithmeticPremises),
   ("proof compression", proofCompression),
   ("maximum nonoverlapping savings", overlappingSavings), ("signature compression", signatureCompression),
-  ("local relation chains", relationChains), ("prune unused local proofs", pruneHaves)]
+  ("local relation chains", relationChains), ("prune unused local proofs", pruneHaves),
+  ("type matching with dependent and unused arguments", matchingTypes), ("select named lints", lintSelection),
+  ("permuted dependent statements", permutedStatements)]
 
 def main (args : List String) : IO UInt32 := do
   ok (← sh "lake" #["build", "leanperf"] (← root))

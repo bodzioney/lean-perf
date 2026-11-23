@@ -54,6 +54,36 @@ def normLevels (e : Expr) : Expr :=
   let ps := (collectLevelParams {} e).params
   e.instantiateLevelParams ps.toList ((List.range ps.size).map fun i => mkLevelParam (.num `u i))
 
+/-- Refine otherwise indistinguishable binders by their roles in the dependent telescope.
+    Each round mixes the ordered dependencies of a binder and the unordered collection of
+    places where other binders depend on it. Renaming or permuting the telescope preserves
+    these colors. Hashes only guide ordering; duplicate reports require exact equality. -/
+private def binderColors (ids anchors : Array FVarId) : MetaM (Std.HashMap FVarId UInt64) := do
+  let mut colors : Std.HashMap FVarId UInt64 := {}
+  let mut deps : Std.HashMap FVarId (Array FVarId) := {}
+  let mut users : Std.HashMap FVarId (Array (FVarId × Nat)) := {}
+  for id in ids do
+    let ty ← id.getType
+    let shape := normLevels (nameless (ty.replace fun e => if e.isFVar then some (mkConst `_) else none))
+    colors := colors.insert id (hash (shape, anchors.idxOf? id))
+    let ds := occOrder ty
+    deps := deps.insert id ds
+    for (dep, i) in ds.zipIdx do
+      users := users.alter dep fun old => some ((old.getD #[]).push (id, i))
+  let mut distinct := (Std.HashSet.ofArray colors.valuesArray).size
+  for _ in [:ids.size] do
+    let mut next := colors
+    for id in ids do
+      let inputs := deps[id]!.map (colors[·]!)
+      let uses := (users[id]?.getD #[]).map fun (owner, i) => (colors[owner]!, i)
+      let uses := uses.qsort fun (a, i) (b, j) => a < b || (a == b && i < j)
+      next := next.insert id (hash (colors[id]!, inputs, uses))
+    colors := next
+    let n := (Std.HashSet.ofArray colors.valuesArray).size
+    if n == distinct then break
+    distinct := n
+  return colors
+
 /--
 A representative of `type` up to binder names (bound occurrences use de Bruijn indices), binder annotations,
 universe names and any reordering of binders that respects dependencies. Binders are ordered by
@@ -62,10 +92,12 @@ shape of their types, then stably sorted so that each binder follows its depende
 
 Equal representatives are a proof of equivalence. Unequal ones are not a proof of inequivalence.
 -/
-def canonical (type : Expr) : MetaM Expr :=
+private def canonicalWithOrder (type : Expr) : MetaM (Expr × Array Nat) :=
   forallTelescope type fun xs body => do
     let ids := xs.map (·.fvarId!)
     let mut order := occOrder body
+    let anchors := order
+    let mut colors : Option (Std.HashMap FVarId UInt64) := none
     let mut i := 0
     while order.size < ids.size do
       if h : i < order.size then
@@ -79,11 +111,15 @@ def canonical (type : Expr) : MetaM Expr :=
         let rest := ids.filter (!order.contains ·)
         let mut best := rest[0]!
         let mut bestKey ← shape best
-        for id in rest do
+        for id in rest.extract 1 rest.size do
           let k ← shape id
           if k < bestKey then
             best := id
             bestKey := k
+          else if k == bestKey then
+            let cs ← colors.getDM (binderColors ids anchors)
+            colors := some cs
+            if cs[id]! < cs[best]! then best := id
         order := order.push best
     let mut sorted : Array FVarId := #[]
     let mut pending := order
@@ -96,7 +132,9 @@ def canonical (type : Expr) : MetaM Expr :=
       let some id := pick | throwError "binder dependency cycle"
       sorted := sorted.push id
       pending := pending.erase id
-    return normLevels (nameless (← mkForallFVars (sorted.map mkFVar) body))
+    return (normLevels (nameless (← mkForallFVars (sorted.map mkFVar) body)), sorted.map ids.idxOf)
+
+def canonical (type : Expr) : MetaM Expr := return (← canonicalWithOrder type).1
 
 /-- Whether an imported theorem is something a person would cite. -/
 def citable (env : Environment) (n : Name) : CoreM Bool := do
@@ -331,6 +369,7 @@ private structure ImportedTheorem where
 
 private structure ImportedIndex where
   duplicates : Std.HashMap UInt64 (Array Name)
+  exact : IO.Ref (Std.HashMap UInt64 (Std.HashMap Expr (Array Name)))
   patterns : Std.HashMap ConclusionShape (Array ImportedTheorem)
   trees : IO.Ref (Std.HashMap ConclusionShape (LazyDiscrTree.ModuleDiscrTreeRef Name))
 
@@ -346,7 +385,20 @@ private def importedIndex (base : Environment) (general : Bool) : IO ImportedInd
         let shape := conclusionShape thm.type.getForallBody
         patterns := patterns.alter shape fun a => some ((a.getD #[]).push ⟨order, mod, c⟩)
         order := order + 1
-  return { duplicates, patterns, trees := ← IO.mkRef {} }
+  return { duplicates, patterns, exact := ← IO.mkRef {}, trees := ← IO.mkRef {} }
+
+private def importDuplicates (idx : ImportedIndex) (bucket : UInt64) (key : Expr) : MetaM (Array Name) := do
+  let some names := idx.duplicates[bucket]? | return #[]
+  if let some exact := (← idx.exact.get)[bucket]? then return exact[key]?.getD #[]
+  let env ← getEnv
+  let mut exact := {}
+  for n in names do
+    if n.isInternalDetail || isPrivateName n then continue
+    let some info := env.find? n | continue
+    let ty ← canonical info.type
+    exact := exact.alter ty fun ns => some ((ns.getD #[]).push n)
+  idx.exact.modify (·.insert bucket exact)
+  return exact[key]?.getD #[]
 
 /-- The old search already required syntactic equality after instantiation. Only these disjoint
     buckets can satisfy that check. Wildcard operands include higher-order variable applications. -/
@@ -383,21 +435,22 @@ private def importMatches (idx : ImportedIndex) (goal : Expr) :
   LazyDiscrTree.findModuleMatches tree goal
 
 private structure Index where
-  localDups : Std.HashMap UInt64 (Array Name)
+  localDups : Std.HashMap Expr (Array Name)
   imports : ImportedIndex
-  project : LazyDiscrTree.ModuleDiscrTreeRef Name
+  project : Option (LazyDiscrTree.ModuleDiscrTreeRef Name)
 
 private def buildIndex (env : Environment) (decls : Std.HashMap Name (Name × Nat)) (opts : Options)
-    (imports : ImportedIndex) : IO Index := do
+    (imports : ImportedIndex) (general : Bool) : IO Index := do
   let localDups ← runMeta env opts do
-    let mut dups : Std.HashMap UInt64 (Array Name) := {}
+    let mut dups : Std.HashMap Expr (Array Name) := {}
     for (n, _) in decls do
-      let k := duplicateKey (← getConstInfo n).type
+      let k ← canonical (← getConstInfo n).type
       dups := dups.alter k fun a => some ((a.getD #[]).push n)
     return dups
-  let project ← runMeta env opts do
+  let project ← if general then runMeta env opts do
     let t ← LazyDiscrTree.createModuleDiscrTree (treeEntry (some decls))
-    return { ref := ← IO.mkRef (← LazyDiscrTree.dropKeys t droppedKeys) }
+    return some { ref := ← IO.mkRef (← LazyDiscrTree.dropKeys t droppedKeys) }
+  else pure none
   return { localDups, imports, project }
 
 /-! ## Queries -/
@@ -419,6 +472,54 @@ private def accessible (xs : Array Expr) (i : Nat) : MetaM (Option Name) := do
     if (← xs[j]!.fvarId!.getUserName) == n then return none
   return some n
 
+private def withIntros (term : String) (xs : Array Expr) (inScope : Nat) : MetaM String := do
+  if inScope == xs.size then return term
+  let mut names := #[]
+  for i in [inScope:xs.size] do
+    names := names.push (((← accessible xs i).map toString).getD "_")
+  return s!"by intro {" ".intercalate names.toList}; exact {term}"
+
+/-- Equal canonical types provide a bijection even for a parameter that does not occur in the
+    conclusion or in any hypothesis. Unification alone cannot infer such an argument. -/
+private def alignedProof (x : Name) (candidate target : Array Nat) (xs : Array Expr)
+    (inScope : Nat) : MetaM String := do
+  let mut args := Array.replicate xs.size "_"
+  for i in candidate, j in target do
+    if let some n ← accessible xs j then args := args.set! i n.toString
+    else if ← isProp (← inferType xs[j]!) then args := args.set! i "(by assumption)"
+  withIntros (" ".intercalate (s!"@{sourceName x}" :: args.toList)) xs inScope
+
+/-- Alternative premise assignments matter when a conclusion leaves an argument undetermined.
+    Every premise must hold for the same substitution. Conjunction projections are ordinary
+    proof terms, so they can be printed in the final theorem application. -/
+private def premiseFacts : MetaM (Array (Expr × Expr)) := do
+  let mut facts := #[]
+  for d in ← getLCtx do
+    if d.isImplementationDetail || !(← isProp d.type) then continue
+    facts := facts.push (d.toExpr, d.type)
+    if d.type.isAppOfArity ``And 2 then
+      facts := facts.push (← mkAppM ``And.left #[d.toExpr], d.type.appFn!.appArg!)
+      facts := facts.push (← mkAppM ``And.right #[d.toExpr], d.type.appArg!)
+  return facts.reverse
+
+private def matchPremises (facts : Array (Expr × Expr)) (remaining : IO.Ref Nat) :
+    List Expr → MetaM Bool
+  | [] => pure true
+  | arg :: rest => do
+    let m := arg.mvarId!
+    let ty ← m.getType
+    if (← m.isAssigned) || !(← isProp ty) then return ← matchPremises facts remaining rest
+    let saved ← saveState
+    for (value, type) in facts do
+      if ← withReducible (isDefEq type ty) then
+        let fuel ← remaining.get
+        if fuel == 0 then saved.restore; return false
+        remaining.set (fuel - 1)
+        m.assign value
+        if ← matchPremises facts remaining rest then return true
+      saved.restore
+    return false
+
 /--
 Check that lemma `x` proves `concl` by instantiating its arguments, with the instantiated
 conclusion syntactically equal to `concl`. Hypotheses are closed by a local assumption or by
@@ -433,10 +534,14 @@ def instantiate (x : Name) (pre post : Array Expr) (concl : Expr) : MetaM (Optio
   unless ← withReducible (isDefEq xConcl concl) do return none
   if (← instantiateMVars xConcl) != concl then return none
   -- Hypotheses first: matching one against a local can assign arguments the conclusion lacks.
+  let start ← saveState
   for m in ms do
     let m := m.mvarId!
     if !(← m.isAssigned) && (← isProp (← m.getType)) then
-      unless ← m.assumptionCore do return none
+      unless ← m.assumptionCore do
+        start.restore
+        unless ← matchPremises (← premiseFacts) (← IO.mkRef 64) ms.toList do return none
+        break
   for m in ms do
     let m := m.mvarId!
     if ← m.isAssigned then continue
@@ -456,12 +561,12 @@ def instantiate (x : Name) (pre post : Array Expr) (concl : Expr) : MetaM (Optio
       | some n => pure n.toString
       | none =>
         if bi.isInstImplicit then pure "_"
-        else if ← isProp (← inferType v) then pure "(by assumption)" else pure "_"
+        else if ← isProp (← inferType v) then
+          if v.isFVar then pure "(by assumption)" else pure s!"({(← ppExpr v).pretty 200})"
+        else pure "_"
     args := args.push arg
   let term := " ".intercalate (s!"@{sourceName x}" :: args.toList)
-  if post.isEmpty then return some term
-  let intros := (names.extract pre.size names.size).map fun n? => (n?.map toString).getD "_"
-  return some s!"by intro {" ".intercalate intros.toList}; exact {term}"
+  return some (← withIntros term xs pre.size)
 
 abbrev confirm := ProofCompression.confirm
 
@@ -476,18 +581,18 @@ private def budget (x : MetaM (Option α)) (n : Nat := 200000) : MetaM (Option �
 
 /-- Search the module's own declarations and imports. Check each proof in the declaration's environment. -/
 private def search (idx : Index) (decl : Name) (inScope : Nat)
-    (visible : Name → Bool) (general : Bool) (checkEnv : Environment) :
+    (visible : Name → Bool) (duplicates : Bool) (checkEnv : Environment) :
     MetaM (Option Match) := do
   let ty := (← getConstInfo decl).type
-  let key ← canonical ty
+  let (key, targetOrder) ← canonicalWithOrder ty
   let env ← getEnv
   let mut dups := #[]
   let bucket := duplicateKey ty
-  let found := idx.localDups[bucket]?.getD #[] ++ idx.imports.duplicates[bucket]?.getD #[]
+  let found := idx.localDups[key]?.getD #[] ++ (← importDuplicates idx.imports bucket key)
   for x in found do
     if x == decl || !env.contains x then continue
     if (env.getModuleIdxFor? x).isSome && !(← citable env x) then continue
-    if (← canonical (← getConstInfo x).type) == key && !dups.contains x then dups := dups.push x
+    dups := dups.push x
   dups := dups.qsort (·.toString < ·.toString)
   let plain (n : Name) : MetaM Expr := return normLevels (nameless (← getConstInfo n).type)
   -- `pre` are in scope in the proof; the proof's own type `rest` binds the others.
@@ -495,24 +600,28 @@ private def search (idx : Index) (decl : Name) (inScope : Nat)
     let attempt (x : Name) (duplicate : Bool) : MetaM (Option Match) := do
       let reordered := duplicate && (← plain x) != (← plain decl)
       if !visible x then return some { lemma := x, duplicate, reordered, term := none }
-      let some term ← forallTelescope rest fun post concl =>
-        budget (instantiate x pre post concl) | return none
+      let term? ← forallTelescope rest fun post concl => do
+        if duplicate then
+          let (_, order) ← canonicalWithOrder (← getConstInfo x).type
+          return some (← alignedProof x order targetOrder (pre ++ post) inScope)
+        budget (instantiate x pre post concl)
+      let some term := term? | return none
       -- Elaborate the proof where it will be: no later declarations, no later modules.
       let ok := (← budget do return some (← withEnv checkEnv (confirm rest term))).getD false
       return some { lemma := x, duplicate, reordered, term := if ok then some term else none }
     -- Prefer what the new theorem can cite: a restatement, then a more general lemma.
     let mut fallback := none
     -- Prefer a restatement whose arguments line up, then any, deterministically.
-    let ranked ← (dups.filter visible).mapM fun x => return ((← plain x) != (← plain decl), x)
+    let ranked ← (if duplicates then dups.filter visible else #[]).mapM fun x => return ((← plain x) != (← plain decl), x)
     let ranked := ranked.qsort fun (r, x) (r', x') => (!r && r') || (r == r' && x.toString < x'.toString)
     for (_, x) in ranked do
       if let some m ← attempt x true then
         if m.term.isSome then return some m
         fallback := fallback <|> some m
-    if general then
+    if let some project := idx.project then
       let cands ← forallTelescope rest fun _ concl => do
         let imported ← importMatches idx.imports concl
-        let local_ ← LazyDiscrTree.findModuleMatches idx.project concl
+        let local_ ← LazyDiscrTree.findModuleMatches project concl
         return local_.appendResults (imported.appendResults #[])
       -- Most specific patterns (highest match scores) come last.
       for x in cands.reverse do
@@ -548,10 +657,10 @@ def message (decl : Name) (m : Match) (visible : Bool) : String :=
 
 /-- Every declaration is checked in its own module with precisely its direct imports. -/
 private def report (opts : Options) (mod : Name) (env : Environment) (res : FileResult)
-    (general : Bool) (imports : ImportedIndex) : IO Report := do
+    (general duplicates : Bool) (imports : ImportedIndex) : IO Report := do
   let position : Std.HashMap Name (Name × Nat) := res.decls.foldl (init := {}) fun acc d =>
     acc.insert d.name (mod, acc.size)
-  let idx ← buildIndex env position opts imports
+  let idx ← buildIndex env position opts imports general
   let visibleFrom (k : Nat) (x : Name) : Bool :=
     match position[x]? with
     | some (_, j) => j < k
@@ -561,7 +670,7 @@ private def report (opts : Options) (mod : Name) (env : Environment) (res : File
     let d := res.decls[k]
     let found ← runMeta env opts do
       tryCatchRuntimeEx
-        (search idx d.name d.inScope (visibleFrom k) general d.env)
+        (search idx d.name d.inScope (visibleFrom k) duplicates d.env)
         fun _ => return none
     let some found := found | continue
     let edit := do
@@ -654,9 +763,11 @@ private def worker (context : IO.Ref (Option Context)) (dir : FilePath) (query :
     context.set (some c)
     return c
   let base := ctx.base.setMainModule job.mod
+  let enabled (name : String) := !job.options.contains ("--skip-lint=" ++ name)
   if tactics then
     let minSaving := (req.getObjValAs? Nat "minSaving").toOption.getD 1000
-    let compression ← if (req.getObjValAs? Bool "compress").toOption.getD false then do
+    let compress := (req.getObjValAs? Bool "compress").toOption.getD false
+    let compression ← if compress && enabled "reuseProof" then do
         let idx ← (← ctx.proofIndex.get).getDM do
           let idx := ProofCompression.importIndex ctx.base
           ctx.proofIndex.set (some idx)
@@ -664,8 +775,10 @@ private def worker (context : IO.Ref (Option Context)) (dir : FilePath) (query :
         pure (some idx)
       else pure none
     let r ← Tactics.analyze base job.mod job.source.toString input opts minSaving
+      (tactics := enabled "fasterTactic") (options := enabled "unneededOption")
       (shorter := (req.getObjValAs? Bool "shorter").toOption.getD false)
       (compression := compression)
+      (signatures := compress && enabled "shorterSignature") (prune := compress && enabled "unusedHave")
     let findings := r.edits.map fun e =>
       { rule := e.rule, message := e.message, lemma := "", range := e.range
         edit := some { range := e.range, newText := e.newText } : Finding }
@@ -700,7 +813,7 @@ private def worker (context : IO.Ref (Option Context)) (dir : FilePath) (query :
         let idx ← importedIndex base (!job.options.contains "--no-general")
         ctx.index.set (some idx)
         return idx
-      r ← report opts job.mod env res (!job.options.contains "--no-general") imports
+      r ← report opts job.mod env res (!job.options.contains "--no-general") (enabled "duplicate") imports
     IO.FS.writeFile (dir / "result.json") (toJson r).compress
 
 structure Entry where
@@ -757,6 +870,7 @@ private unsafe def compareTypes (a : FilePath) (i : Nat) (b : FilePath) (j : Nat
 
 private unsafe def projectReport (w : Workspace) (m : Name) (dir : FilePath)
     (sigs : Array Build.Signature) (r : Report) : IO Report := do
+  if w.plan.jobs[m]!.options.contains "--skip-lint=duplicate" then return r
   let mut findings := r.findings
   let reported := Std.HashSet.ofArray (r.findings.map fun f => (f.range.start.line, f.range.start.character))
   for h : i in [:sigs.size] do
@@ -799,8 +913,14 @@ private unsafe def answer (slot : Build.Slot) (w : Workspace) (m : Name) (req : 
   IO.FS.withTempDir fun dir => do
     IO.FS.writeFile (dir / "job.json") (toJson job).compress
     IO.FS.writeFile (dir / "request.json") req.compress
-    -- Include dependency keys so editing a dependency retires its old initialized process.
-    Build.submit slot (hash (job.headerKey, job.deps.map (·.dir.toString))) dir true
+    -- Lean initializers run once per process. An unsaved buffer can change the imports even
+    -- when it still has the same path and planned dependency artifacts.
+    let headerKey ← if let some source := text.filter (fun _ => !saved) then do
+        let (stx, _, _) ← Parser.parseHeader (Parser.mkInputContext source job.source.toString)
+        let hdr : HeaderSyntax := stx
+        pure (hash (hdr.isModule, hdr.imports))
+      else pure job.headerKey
+    Build.submit slot (hash (headerKey, job.options, job.deps.map (·.dir.toString))) dir true
     if raw then
       let result : Json ← Build.readJson (dir / "result.json")
       if cacheTactics && (result.getObjValAs? Nat "elabErrors").toOption == some 0 then
@@ -896,7 +1016,7 @@ Run from the target Lake project. Reports checked proof terms and their location
     if let some n := a.dropPrefix? "--min-saving=" then
       minSaving := (n.toString.toNat?.getD 1) * 1000
       continue
-    if a.startsWith "-D" || a == "--no-general" then options := options.push a
+    if a.startsWith "-D" || a == "--no-general" || a.startsWith "--skip-lint=" then options := options.push a
     else if let some n := a.dropPrefix? "--jobs=" then workers := n.toString
     else if let some p := a.dropPrefix? "--file-list=" then
       let paths : Array System.FilePath ← Build.readJson p.toString

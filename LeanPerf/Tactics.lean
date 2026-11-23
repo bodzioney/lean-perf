@@ -240,13 +240,15 @@ structure Result where
 /-- Elaborate `input` on top of `env` (its imports), collecting edits. -/
 def analyze (env : Environment) (main : Name) (fileName input : String) (opts : Options)
     (minSaving : Nat := 1000) (tactics options : Bool := true) (shorter := false)
-    (compression : Option ProofCompression.Index := none) : IO Result := do
+    (compression : Option ProofCompression.Index := none)
+    (signatures prune := compression.isSome) : IO Result := do
   let ictx := Parser.mkInputContext input fileName
   let (_, ps0, _) ← Parser.parseHeader ictx
   let mut s := Command.mkState (env.setMainModule main) {} opts
   let mut ps := ps0
   let mut res : Result := {}
   let mut localProofs : ProofCompression.Index := {}
+  let needInfo := tactics || signatures || compression.isSome
   repeat
     let scope := s.scopes.head!
     let pctx : Parser.ParserModuleContext :=
@@ -260,7 +262,7 @@ def analyze (env : Environment) (main : Name) (fileName input : String) (opts : 
     if Parser.isTerminalCommand cmd then break
     let ctx : Command.Context :=
       { fileName, fileMap := ictx.fileMap, cmdPos := pos, snap? := none, cancelTk? := none }
-    let before := { s with messages := {}, infoState := { enabled := tactics } }
+    let before := { s with messages := {}, infoState := { enabled := needInfo } }
     match ← ((Command.elabCommandTopLevel cmd).run ctx |>.run before).toIO' with
     | .error e =>
       res := { res with errors := res.errors.push (← e.toMessageData.toString) }
@@ -270,19 +272,21 @@ def analyze (env : Environment) (main : Name) (fileName input : String) (opts : 
           if m.severity == .error && res.errors.size < 5 then
             res := { res with errors := res.errors.push s!"{m.pos.line}:{m.pos.column + 1}: {← m.data.toString}" }
       else
-        if compression.isSome then
+        if signatures then
           if let some e ← Signature.compress input ictx.fileMap cmd ctx before after then
             res := { res with edits := res.edits.push {
               rule := "shorterSignature", message := "Shorten the theorem statement",
               range := e.range, newText := e.newText } }
+        if prune then
           if let some e ← Prune.proof? input ictx.fileMap cmd pctx ctx before after then
             res := { res with edits := res.edits.push {
               rule := "unusedHave", message := "Remove unused local proofs",
               range := e.range, newText := e.newText } }
-        if tactics then
+        if tactics || compression.isSome then
           let mut names : NameSet := {}
           for t in after.infoState.trees do
-            res := { res with edits := res.edits ++ (← tacticEdits input ictx.fileMap t minSaving shorter) }
+            if tactics then
+              res := { res with edits := res.edits ++ (← tacticEdits input ictx.fileMap t minSaving shorter) }
             if let some imports := compression then
               let (edits, decls) ← ProofCompression.scan input ictx.fileMap t imports localProofs
               names := names.merge decls
@@ -302,7 +306,7 @@ def analyze (env : Environment) (main : Name) (fileName input : String) (opts : 
                 res := { res with edits := res.edits.push {
                   rule := "unneededOption", message := s!"`set_option {o}` is not needed here"
                   range := ictx.fileMap.utf8RangeToLspRange ⟨a, b⟩, newText := "" } }
-      s := { after with infoState := { enabled := tactics } }
+      s := { after with infoState := { enabled := needInfo } }
   return res
 
 /-- Apply non-overlapping edits, later ones first. Returns the new text and how many applied. -/

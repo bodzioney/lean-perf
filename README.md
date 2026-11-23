@@ -1,6 +1,6 @@
 # LeanPerf
 
-LeanPerf finds and rewrites Lean proof patterns by parsing source text. Its command line and language server use the same Lean rules. You can lint an unsaved buffer or an entire source tree before any project dependency has been built.
+LeanPerf finds duplicate theorems, replaces expensive tactics, and shortens proofs and theorem statements. The default syntax lints work on an unsaved buffer or a whole source tree before dependencies are built. The elaborated modes use Lean to construct and check candidate proofs.
 
 The default scan reads Lean files. The parser loads its own grammar and the pinned Lean toolchain. Project imports, tactics, macros, `#eval` commands and the project's Lake configuration are never executed by the scan.
 
@@ -22,13 +22,33 @@ Install Elan with the toolchain in `lean-toolchain` (Lean 4.37.0-rc1) and run `l
 ~/Code/lean-perf/.lake/build/bin/leanperf --bench 4 src/Example.lean
 ```
 
-`--rules` takes a comma-separated list of rule names. Preview and apply are syntax-only by default. `--check` and `--bench` explicitly run the target's Lake configuration and Lean elaborator. Run these two modes from the target's Lake project root with its imports already built. They use `lake --no-build --no-cache lean` on the original module path and supply the candidate on stdin. A failed check leaves that file alone and produces a nonzero exit status. Directory edits are atomic per file.
+Preview and apply are syntax-only by default. `--check` and `--bench` explicitly run the target's Lake configuration and Lean elaborator. Run these two modes from the target's Lake project root with its imports already built. They use `lake --no-build --no-cache lean` on the original module path and supply the candidate on stdin. A failed check leaves that file alone and produces a nonzero exit status.
 
 `--shorter` selects edits that reduce the UTF-8 byte count of the replaced source. Use it for proof compression, including with `--dedup --check --apply`. Measure compilation time separately with `--bench`.
 
 Timing includes Lake startup and import loading. The benchmark alternates the order of the two versions and reports median wall time. The effect on a full build depends on which modules are rebuilt.
 
-## Rules
+## Choosing lints
+
+Run `leanperf --list-lints` to see each lint's name, mode and purpose. Pick the mode that fits your goal. Within that mode, `--rules` selects a comma-separated list and `--allow` (or `-A`) suppresses named lints. Existing names also appear in diagnostics. The individual names and allow switch follow the approach used by [Clippy](https://doc.rust-lang.org/clippy/configuration.html#allowingdenying-lints).
+
+| Goal | Mode | Available lints |
+|---|---|---|
+| Clean up straightforward proof syntax | Default | `simpRfl`, `rflTerm`, `exactUsing`, `splitObtain` |
+| Find likely restatements before building dependencies | `--dedup-pass syntax` | `syntacticDuplicate` |
+| Find restatements and more general theorems | `--dedup-pass elaborate` | `duplicate`, `specialCase` |
+| Reduce tactic search | `--tactics` | `fasterTactic`, `unneededOption` |
+| Reduce UTF-8 source size with a checked rewrite | `--compress` | `reuseProof`, `shorterSignature`, `unusedHave`, plus both tactic lints |
+
+```sh
+leanperf --dedup-pass elaborate --rules duplicate --check src/
+leanperf --dedup-pass elaborate --rules specialCase --shorter --check src/
+leanperf --compress -A shorterSignature src/
+```
+
+Selecting only `duplicate` skips the general-theorem search index. A compression run that excludes `reuseProof` skips its imported proof index. The batch modes preview changes by default. Add `--apply` to write the selected edits.
+
+## Syntax rules
 
 | Rule | Candidate |
 |---|---|
@@ -39,7 +59,7 @@ Timing includes Lake startup and import loading. The benchmark alternates the or
 
 For example, LeanPerf can recognize `example (x : Nat) : x = x := by simp` directly. A goal such as `0 + x = x`, or a `simp` after another tactic, needs information outside that pattern. LeanPerf skips those cases. A syntax match is a candidate for a proof edit. Use `--check` for compiler confirmation.
 
-The parser understands the pinned Lean grammar and a small set of common Mathlib notation. Commands that need other imported or locally declared syntax can be skipped. The CLI reports how many commands the parser could not read. Add parser declarations in `LeanPerf/Grammar.lean` and rewrite rules in `LeanPerf.lean`.
+The parser understands the pinned Lean grammar and a small set of common Mathlib notation. Commands that need other imported or locally declared syntax can be skipped. The CLI reports how many commands the parser could not read. The parser declarations live in `LeanPerf/Grammar.lean`, the syntax rules in `LeanPerf/Rules.lean` and the lint catalog in `LeanPerf/Lints.lean`.
 
 ## Duplicate theorems
 
@@ -83,6 +103,10 @@ For statement comparison, LeanPerf opens the outer binders, orders them subject 
 Requested modules and their unbuilt project dependencies are elaborated as skeletons. LeanPerf can import a project dependency with an up-to-date `.olean`. Skeletons replace theorem proofs and proposition-valued tactic blocks with `sorry`, skip kernel checking, and retain executable definitions for imported metaprograms. A failed skeleton reports its errors and can be retried after correction. With `--check`, LeanPerf elaborates the entire edited module with its proofs and kernel checks enabled against its dependency skeletons. Verifying the complete proof development requires a full Lean build. The native launcher reads `srcDir` and global `[leanOptions]` from `lakefile.toml`. Per-library options are currently unsupported.
 
 Unlike the default scan, the elaborated pass runs the target's Lake configuration and imports its dependencies, including their tactics and macros. The target must use LeanPerf's toolchain (`lean-toolchain`), since `.olean` files are specific to one Lean version.
+
+The elaborated matcher distinguishes two useful questions. For **duplicates**, it compares the closed types and keeps the binder correspondence. If two binders both have type `Nat`, their occurrences in later hypotheses can tell them apart. Even an argument unused by the original theorem can be supplied in a replacement. Each imported bucket of canonical types is indexed on first use.
+
+For **specializations**, the matcher tries to construct an application of the candidate theorem with one consistent substitution. For example, a theorem requiring `Token n` and `Grant n` can use the two projections of a local `h : Token n ∧ Grant n`. If several hypotheses match, the search can revisit its first choice when a later premise fails. It permits up to 64 matching premise assignments per candidate. A `Token n` and a `Grant m` for unrelated indices do not discharge those premises together. The matcher uses no Riemann-specific names or rewrite rules.
 
 ### The syntactic pass
 
@@ -140,3 +164,7 @@ Use `vim.lsp.buf.code_action()` on a diagnostic. To change the defaults, pass `i
 ## Tests
 
 Run `lake test`, or `lake test -- <words>` for the tests whose names contain those words. The integration tests exercise the parser, optional compilation, static rewriting without project dependencies, LSP diagnostics and edits, and both duplicate passes on the core-only project in `tests/dedup`. They also exercise cache reuse, transitive invalidation, concurrent publishers, failed builds, and nested binder shadowing.
+
+The `permuted dependent statements` test generates 24 versions of a theorem with premises `E a b`, `E b c` and `E c d`. It permutes the four data binders and varies the premise order. LeanPerf recognizes all 23 restatements, checks their rewritten proofs, and keeps a theorem with the same binder counts and a different dependency graph. This measures a known family of duplicates. Discovery rates in an arbitrary library depend on which theorems and imports are present.
+
+On 11 unmodified modules from the Riemann project, the elaborated search found zero replacements, with a median cold scan of 12.50 seconds across three runs. Tactic replay had more impact on compilation time in a separate two-module trial on the same revision. Across five alternating Lake checks per version, `GapNum` went from 6.17 to 3.05 seconds and `LargeConstantLeParamCube` from 3.70 to 2.91 seconds on the benchmark machine. These are per-module timings. [Riemann benchmark revision](https://github.com/leanprover-community/riemann-hypothesis/tree/320abbbfc6634dc7b5e9961f940cd7821d37c9e1)
