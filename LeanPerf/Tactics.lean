@@ -1,4 +1,5 @@
 import LeanPerf.ProofCompression
+import LeanPerf.Signature
 
 /-!
 # Cheaper tactics and unneeded option overrides
@@ -241,6 +242,11 @@ def analyze (env : Environment) (main : Name) (fileName input : String) (opts : 
           if m.severity == .error && res.errors.size < 5 then
             res := { res with errors := res.errors.push s!"{m.pos.line}:{m.pos.column + 1}: {← m.data.toString}" }
       else
+        if compression.isSome then
+          if let some e ← Signature.compress input ictx.fileMap cmd ctx before after then
+            res := { res with edits := res.edits.push {
+              rule := "shorterSignature", message := "Shorten the theorem statement",
+              range := e.range, newText := e.newText } }
         if tactics then
           let mut names : NameSet := {}
           for t in after.infoState.trees do

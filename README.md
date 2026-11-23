@@ -114,6 +114,8 @@ Run `leanperf --compress src/` to preview shorter proofs, or add `--apply` to wr
 
 A bounded structural fingerprint indexes theorem conclusions. Lean checks each proposed term in its local context. When edits overlap, the optimizer chooses the combination that saves the most UTF-8 bytes. It preserves comments inside proof blocks and checks the whole rewritten module. Compression also runs the shorter tactic optimizations. Use `--bench` to measure how the edits affect compilation time.
 
+For generated theorem statements with explicit universe arguments or coercions, `--compress` tries Lean's mathematical notation and a spelling that omits explicit universe arguments. It re-elaborates the declaration and compares its exported type structurally, including binder names, implicit and instance arguments, and the ordered universe parameters. This preserves named-argument calls from other modules. Statements containing comments keep their original text.
+
 ## Editor integration
 
 Start `/absolute/path/to/lean-perf/.lake/build/bin/leanperf --lsp` as an additional language server for Lean files. The server accepts full-document changes over stdio and publishes diagnostics for the current buffer version. The editor can request an individual quick fix or `source.fixAll.leanPerf` for the document. Edits use UTF-16 positions and include the document version when the client supports versioned workspace edits.

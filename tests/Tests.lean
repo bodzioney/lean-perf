@@ -516,6 +516,21 @@ def overlappingSavings : IO Unit := do
   check (Cli.rewrite src (inner.push outer) true == ("ab", 2)) "missed disjoint savings"
   check (Cli.rewrite src (inner.push (change 0 8 "x")) true == ("x", 1)) "missed outer savings"
 
+def signatureCompression : IO Unit := withFixture fun r => do
+  let path := r / "Fixture" / "Signatures.lean"
+  let comment := "theorem annotated (x : Nat) : @Eq.{1} /- preserve -/ Nat x x := rfl\n"
+  IO.FS.writeFile path ("import Lean\nuniverse u\n" ++
+    "theorem identityAt : ∀ {A : Type u} [choice : Inhabited A] (item : A), @Eq.{u + 1} A item item := by intros; rfl\n" ++
+    "example : 1 = 1 := identityAt (A := Nat) (choice := inferInstance) (item := 1)\n" ++
+    "theorem pinned : Nonempty.{2} PUnit.{2} := ⟨PUnit.unit⟩\n" ++
+    "run_cmd do\n  let d ← Lean.getConstInfo `pinned\n" ++
+    "  unless d.levelParams.isEmpty do throwError \"pinned acquired a universe parameter\"\n" ++ comment)
+  let o ← run #["--compress", "--apply", path.toString] r
+  ok o; hasErr o "shorterSignature"
+  let text ← IO.FS.readFile path
+  check (has text comment && !has text "@Eq.{u + 1}") text
+  ok (← sh "lake" #["env", "lean", path.toString] r)
+
 def tests : List (String × IO Unit) := [
   ("checked preview", checkedPreview), ("static apply never loads the project", staticApplyNeverLoadsTheProject),
   ("reflexivity term", reflexivityTerm), ("failed check preserves source", failedCheckPreservesSource),
@@ -530,7 +545,7 @@ def tests : List (String × IO Unit) := [
   ("language server, syntax pass", lspSyntax), ("language server, elaborated pass", lspElaborated),
   ("cheaper tactics", tactics), ("tactic cache and dependency skeletons", tacticCache),
   ("arithmetic premise selection", arithmeticPremises), ("proof compression", proofCompression),
-  ("maximum nonoverlapping savings", overlappingSavings)]
+  ("maximum nonoverlapping savings", overlappingSavings), ("signature compression", signatureCompression)]
 
 def main (args : List String) : IO UInt32 := do
   ok (← sh "lake" #["build", "leanperf"] (← root))
