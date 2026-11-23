@@ -1,0 +1,9 @@
+name = "fixture"
+defaultTargets = ["Fixture"]
+
+[leanOptions]
+autoImplicit = false
+
+[[lean_lib]]
+name = "Fixture"
+globs = ["Fixture.+"]

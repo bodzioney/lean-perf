@@ -1,10 +1,19 @@
 name = "leanperf"
 version = "0.1.0"
-defaultTargets = ["leanperf-parser"]
+defaultTargets = ["leanperf"]
+testDriver = "tests"
 
 [[lean_exe]]
-name = "leanperf-parser"
-root = "LeanPerf"
+name = "leanperf"
+root = "LeanPerf.Main"
+supportInterpreter = true
 
 [[lean_lib]]
-name = "LeanPerf.Grammar"
+name = "LeanPerf"
+roots = ["LeanPerf"]
+globs = ["LeanPerf.+"]
+
+[[lean_exe]]
+name = "tests"
+root = "Tests"
+srcDir = "tests"
