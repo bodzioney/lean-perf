@@ -90,7 +90,8 @@ private partial def objectKey (sp : Lean.SearchPath) (syslib : FilePath)
   memo.modify (·.insert m key)
   return key
 
-def plan (root cache : FilePath) (paths : Array FilePath) (options : Array String) : IO Plan := do
+def plan (root cache : FilePath) (paths : Array FilePath) (options : Array String)
+    (dependenciesOnly := false) : IO Plan := do
   let requested := paths.foldl (init := ({} : Std.HashMap Name FilePath)) fun acc p =>
     acc.insert (moduleOf root p) p
   let mut sources : Std.HashMap Name Source := {}
@@ -128,9 +129,12 @@ def plan (root cache : FilePath) (paths : Array FilePath) (options : Array Strin
   let memo ← IO.mkRef {}
   let mut jobs : Std.HashMap Name Job := {}
   let mut keys : Std.HashMap Name UInt64 := {}
+  let mut needed : Std.HashSet Name := {}
   for m in order do
     let src := sources[m]!
     let deps := src.imports.filterMap fun i => jobs[i]?.map (·.toArtifact)
+    if dependenciesOnly then
+      for dep in deps do needed := needed.insert dep.mod
     let built ← sp.findModuleWithExt "olean" m
     if !requested.contains m && deps.isEmpty then
       if let some p := built then
@@ -144,9 +148,13 @@ def plan (root cache : FilePath) (paths : Array FilePath) (options : Array Strin
     keys := keys.insert m key
     jobs := jobs.insert m {
       mod := m, dir := cache / "objects" / toString key
-      source := src.path, sourceHash := src.digest, headerKey := src.headerKey, deps, options, requested := requested.contains m }
-  log s!"{sources.size} project modules: importing {order.size - jobs.size} built, elaborating {jobs.size} skeletons"
-  return { sources, jobs, order := order.filter jobs.contains }
+      source := src.path, sourceHash := src.digest, headerKey := src.headerKey, deps, options,
+      requested := !dependenciesOnly && requested.contains m }
+  -- Keep the job for every target so its proofs can be replayed on demand. In tactic mode
+  -- only modules imported by another job need a published skeleton.
+  let buildOrder := order.filter (if dependenciesOnly then needed.contains else jobs.contains)
+  log s!"{sources.size} project modules: importing {order.size - jobs.size} built, elaborating {buildOrder.size} skeletons"
+  return { sources, jobs, order := buildOrder }
 
 private abbrev Child := IO.Process.Child { stdin := .piped, stdout := .piped }
 

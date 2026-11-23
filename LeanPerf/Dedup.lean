@@ -674,6 +674,7 @@ private def worker (context : IO.Ref (Option Context)) (dir : FilePath) (query :
   if tactics then
     let minSaving := (req.getObjValAs? Nat "minSaving").toOption.getD 1000
     let r ← Tactics.analyze base job.mod job.source.toString input opts minSaving
+      (shorter := (req.getObjValAs? Bool "shorter").toOption.getD false)
     let findings := r.edits.map fun e =>
       { rule := e.rule, message := e.message, lemma := "", range := e.range
         edit := some { range := e.range, newText := e.newText } : Finding }
@@ -719,13 +720,15 @@ structure Entry where
 
 structure Workspace where
   plan : Build.Plan
+  cache : FilePath
   sigs : Std.HashMap Name (Array Build.Signature)
   index : Std.HashMap UInt64 (Array Entry)
 
 private def prepare (root cache : FilePath) (files : Array FilePath) (opts : Array String)
-    (workers : Nat) : IO Workspace := do
-  let plan ← Build.plan root cache files opts
+    (workers : Nat) (tactics : Bool) : IO Workspace := do
+  let plan ← Build.plan root cache files opts (dependenciesOnly := tactics)
   Build.build plan workers
+  if tactics then return { plan, cache, sigs := {}, index := {} }
   let mut sigs := {}
   let mut index : Std.HashMap UInt64 (Array Entry) := {}
   for m in plan.order do
@@ -734,7 +737,7 @@ private def prepare (root cache : FilePath) (files : Array FilePath) (opts : Arr
     for h : i in [:info.decls.size] do
       let d := info.decls[i]
       index := index.alter d.key fun a => some <| (a.getD #[]).push ⟨m, d, i⟩
-  return { plan, sigs, index }
+  return { plan, cache, sigs, index }
 
 private def importsModule (p : Build.Plan) (mod target : Name) : Bool := Id.run do
   let mut todo := #[mod]
@@ -784,12 +787,21 @@ private unsafe def projectReport (w : Workspace) (m : Name) (dir : FilePath)
 
 private unsafe def answer (slot : Build.Slot) (w : Workspace) (m : Name) (req : Json) : IO Json := do
   let job := w.plan.jobs[m]!
-  let saved := !(req.getObjVal? "text").isOk
-  if saved && hash (← IO.FS.readFile job.source) != job.sourceHash then
+  let text := (req.getObjValAs? String "text").toOption
+  if text.isNone && hash (← IO.FS.readFile job.source) != job.sourceHash then
     throw <| IO.userError s!"{job.source} changed after skeleton analysis"
+  let saved := text.all (hash · == job.sourceHash)
   let resultFile := job.dir / "result.json"
-  let raw := (req.getObjValAs? Bool "check").toOption.getD false ||
-    (req.getObjValAs? Bool "tactics").toOption.getD false
+  let checking := (req.getObjValAs? Bool "check").toOption.getD false
+  let tactics := (req.getObjValAs? Bool "tactics").toOption.getD false
+  let raw := checking || tactics
+  -- A leaf may have no skeleton directory. Keep its tactic report independent of skeleton
+  -- publication. The job key already covers the source, imports, options and executable.
+  let minSaving := (req.getObjValAs? Nat "minSaving").toOption.getD 1000
+  let shorter := (req.getObjValAs? Bool "shorter").toOption.getD false
+  let tacticReport := w.cache / "tactics" / s!"{job.dir.fileName.get!}-{minSaving}-{shorter}.json"
+  let cacheTactics := tactics && !checking && saved
+  if cacheTactics && (← tacticReport.pathExists) then return ← Build.readJson tacticReport
   if saved && !raw && (← resultFile.pathExists) then
     return toJson (← projectReport w m job.dir w.sigs[m]! (← Build.readJson resultFile))
   IO.FS.withTempDir fun dir => do
@@ -798,7 +810,16 @@ private unsafe def answer (slot : Build.Slot) (w : Workspace) (m : Name) (req : 
     -- Include dependency keys so editing a dependency retires its old initialized process.
     Build.submit slot (hash (job.headerKey, job.deps.map (·.dir.toString))) dir true
     if raw then
-      return ← Build.readJson (dir / "result.json")
+      let result : Json ← Build.readJson (dir / "result.json")
+      if cacheTactics && (result.getObjValAs? Nat "elabErrors").toOption == some 0 then
+        IO.FS.createDirAll tacticReport.parent.get!
+        let tmp := tacticReport.addExtension s!"tmp-{← IO.Process.getPID}"
+        try
+          IO.FS.writeFile tmp result.compress
+          IO.FS.rename tmp tacticReport
+        finally
+          if ← tmp.pathExists then IO.FS.removeFile tmp
+      return result
     let r : Report ← Build.readJson (dir / "result.json")
     if saved then
       -- This object was first built as a dependency. Publish its local report atomically.
@@ -869,17 +890,19 @@ Run from the target Lake project. Reports checked proof terms and their location
     let p ← Build.plan root cache files options
     Build.build { p with jobs := p.jobs.map fun _ j => { j with requested := false } } jobs
     return 0
-  let mut world ← prepare root cache files options jobs
+  let mut world ← prepare root cache files options jobs tactics
   let slot ← IO.mkRef none
   if batch && tactics then
-    let failed := 0
+    let mut failed := 0
     for path in files do
       let m := Build.moduleOf root path
-      let req := Json.mkObj [("path", path.toString), ("tactics", true), ("minSaving", minSaving)]
+      let req := Json.mkObj [("path", path.toString), ("tactics", true), ("minSaving", minSaving),
+        ("shorter", shorter)]
       let r : Report ← IO.ofExcept (fromJson? (← answer slot world m req))
       for f in r.findings do
         IO.println s!"{path}:{f.range.start.line + 1}:{f.range.start.character + 1}: {f.rule}: {f.message}"
       if r.elabErrors > 0 then
+        failed := failed + 1
         IO.eprintln s!"{path}: {r.elabErrors} commands failed to elaborate; edits there are not suggested"
     Build.stop slot
     return if failed > 0 then 1 else 0
@@ -910,7 +933,11 @@ Run from the target Lake project. Reports checked proof terms and their location
       let m := Build.moduleOf root path
       unless world.plan.jobs.contains m do
         files := files.push path
-        world ← prepare root cache files options jobs
+        world ← prepare root cache files options jobs tactics
+      let req := if tactics && !(req.getObjValAs? Bool "check").toOption.getD false then
+        req.setObjVal! "tactics" true |>.setObjVal! "minSaving" (toJson minSaving)
+          |>.setObjVal! "shorter" (toJson shorter)
+        else req
       answer slot world m req
     catch e => pure (Json.mkObj [("error", toString e)])
     stdout.putStrLn reply.compress

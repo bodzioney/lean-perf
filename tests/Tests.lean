@@ -450,6 +450,47 @@ def tactics : IO Unit := withFixture fun r => do
   check (!(has t "set_option") && has t "simpa only [List.append_nil] using congrArg List.length h") t
   ok (← sh "lake" #["env", "lean", path.toString] r)
 
+def tacticCache : IO Unit := withFixture fun r => do
+  let path := r / "Fixture" / "Leaf.lean"
+  let base := r / "Fixture" / "Base.lean"
+  let marker := r / "replays"
+  let source := "import Lean\nimport Fixture.Base\n" ++
+    "run_cmd IO.FS.withFile \"replays\" .append fun h => h.putStrLn \"ran\"\n" ++
+    "theorem leaf (xs ys : List Nat) (h : xs = ys) : (xs ++ []).length = ys.length := by simpa using congrArg List.length h\n"
+  IO.FS.writeFile path source
+  let scan (saving : Nat) := run #["--tactics", "--min-saving", toString saving,
+    path.toString, base.toString, path.toString] r
+  let first ← scan 0
+  ok first; hasErr first "1 built"; hasErr first "fasterTactic"
+  let cached ← scan 0
+  ok cached; hasErr cached "1 reused, 0 built"
+  check (first.out == cached.out && (← IO.FS.readFile marker) == "ran\n") cached.out
+  let high ← scan 100000
+  ok high; check (high.out == "") high.out
+  IO.FS.writeFile base ((← IO.FS.readFile base) ++ "\n-- dependency changed\n")
+  ok (← scan 0)
+  check ((← IO.FS.readFile marker) == "ran\nran\nran\n") "threshold or dependency cache key"
+  IO.FS.writeFile path (source ++ "example : False := True.intro\n")
+  for _ in [:2] do
+    let broken ← scan 0
+    check (broken.code != 0) "broken tactic input succeeded"
+    hasErr broken "1 failed files"
+  check ((← IO.FS.readFile marker) == "ran\nran\nran\nran\nran\n") "cached an incomplete analysis"
+
+def arithmeticPremises : IO Unit := withFixture fun r => do
+  let path := r / "Fixture" / "Arithmetic.lean"
+  -- Stand-ins let this core-only fixture exercise premise discovery and replay. The unused
+  -- local must disappear and the longer explicit proof must not hide a shorter alternative.
+  IO.FS.writeFile path ("macro \"nlinarith\" : tactic => `(tactic| first | rfl | rfl | rfl | assumption)\n" ++
+    "macro \"linarith\" : tactic => `(tactic| first | rfl | assumption)\n" ++
+    "macro \"linarith\" \" only \" \"[\" h:ident \"]\" : tactic => `(tactic| exact $h)\n" ++
+    "theorem choose (P Q : Prop) (unused : Q) (needed : P) : P := by nlinarith\n")
+  let args := #["--tactics", "--min-saving", "0", "--check", path.toString]
+  let fastest ← run args r
+  ok fastest; hasOut fastest ": P := by linarith only [needed]\n"
+  let shorter ← run (args.push "--shorter") r
+  ok shorter; hasOut shorter ": P := by linarith\n"
+
 def tests : List (String × IO Unit) := [
   ("checked preview", checkedPreview), ("static apply never loads the project", staticApplyNeverLoadsTheProject),
   ("reflexivity term", reflexivityTerm), ("failed check preserves source", failedCheckPreservesSource),
@@ -462,7 +503,8 @@ def tests : List (String × IO Unit) := [
   ("syntactic pass runs nothing", syntacticRunsNothing), ("checked apply without a build", checkedApplyWithoutBuild),
   ("check rejects a wrong proof", checkRejectsWrongProof), ("checked apply with a build", checkedApplyWithBuild),
   ("language server, syntax pass", lspSyntax), ("language server, elaborated pass", lspElaborated),
-  ("cheaper tactics", tactics)]
+  ("cheaper tactics", tactics), ("tactic cache and dependency skeletons", tacticCache),
+  ("arithmetic premise selection", arithmeticPremises)]
 
 def main (args : List String) : IO UInt32 := do
   ok (← sh "lake" #["build", "leanperf"] (← root))

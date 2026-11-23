@@ -94,7 +94,9 @@ For both passes, a restatement that the theorem cannot cite, because its module 
 
 ## Cheaper tactics
 
-`--tactics` elaborates each module once against dependency skeletons, so nothing needs to be built first. At every `nlinarith`, `norm_num`, `simp`, `simp_all` and `simpa` it replays cheaper candidates on exactly the goals the original ran on: `linarith` and `positivity` for `nlinarith`, `simp` for `norm_num`, and the `simp only` call that `simp?`, `simp_all?` or `simpa?` suggests. A candidate is kept when, on every goal, it leaves the same goals (compared as closed terms with their hypothesis names), reports no error, puts no `sorry` in the proof, and costs fewer heartbeats. It also re-elaborates every `set_option o v in` command for `maxHeartbeats`, `synthInstance.maxHeartbeats`, `maxRecDepth`, `synthInstance.maxSize` and the `backward.isDefEq` options without the option, and suggests deleting the override when the command still elaborates.
+`--tactics` replays alternative tactics on the goals where the original tactic ran. For a bare `linarith` or `nlinarith`, it reads the local hypotheses used by the original proof term and tries restricting arithmetic search to those hypotheses with `only [...]`. It also tries `linarith` and `positivity` for `nlinarith`, `simp` for `norm_num`, and the explicit simplification suggested by `simp?`, `simp_all?` or `simpa?`.
+
+A candidate must leave the same goals on every replay, introduce no errors or `sorry`, and use fewer heartbeats in total. Goals are compared as closed terms with their hypothesis names. With `--shorter`, the pass selects the cheapest successful candidate that also reduces the source byte count. The pass also tries deleting scoped overrides of `maxHeartbeats`, `synthInstance.maxHeartbeats`, `maxRecDepth`, `synthInstance.maxSize` and the supported `backward.isDefEq` options, checking whether the command still elaborates.
 
 ```sh
 # Preview, then apply after elaborating each edited module in full
@@ -102,7 +104,9 @@ For both passes, a restatement that the theorem cannot cite, because its module 
 ~/Code/lean-perf/.lake/build/bin/leanperf --tactics --check --apply src/Example.lean
 ```
 
-Heartbeats are deterministic but count elaboration only. Kernel checking is not included, so confirm wall time with `--bench` where it matters. `--min-saving N` (default 1) skips edits that save fewer than `N` heartbeats.
+The tactic pass builds skeletons only for project modules imported by another target or dependency. External imports must already have compatible `.olean` files. It caches successful replay results under `.lake/leanperf/tactics`, keyed by the source, dependencies, build settings, LeanPerf executable, `--min-saving` and `--shorter`. `--check` elaborates the edited module even on a cache hit. Set `LEANPERF_CACHE_DIR` to choose another cache directory.
+
+Heartbeats measure elaboration. Use `--bench` to measure wall time including kernel checking. `--min-saving N` (default 1) skips edits that save fewer than `N` heartbeats.
 
 ## Editor integration
 

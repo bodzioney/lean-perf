@@ -122,13 +122,15 @@ def syntaxAnalyzer (root : FilePath) (paths : Array FilePath) : IO Analyzer := d
 
 /-- This executable under `lake env` in the target project, answering one JSON request per line. -/
 def elaboratedAnalyzer (root : FilePath) (paths : Array FilePath) (general := true)
-    (jobs : Option Nat := none) (extra : List (String × Json) := []) : IO Analyzer := do
+    (jobs : Option Nat := none) (tacticSaving : Option Nat := none) (shorter := false) : IO Analyzer := do
   if let some r ← toolchainMismatch root then
     throw <| IO.userError s!"cannot elaborate the project: {r}"
   let (h, listing) ← IO.FS.createTempFile
   h.putStr (toJson (paths.map (·.toString))).compress
   h.flush
   let args := #["--project", "--serve"] ++ (if general then #[] else #["--no-general"]) ++
+    (tacticSaving.map (fun n => #["--tactics", s!"--min-saving={n}"])).getD #[] ++
+    (if shorter then #["--shorter"] else #[]) ++
     (jobs.map (#[s!"--jobs={·}"])).getD #[] ++ #[s!"--file-list={listing}"]
   let child ← IO.Process.spawn { cmd := (← IO.appPath).toString, args, cwd := root,
                                  stdin := .piped, stdout := .piped, stderr := .inherit }
@@ -147,12 +149,14 @@ def elaboratedAnalyzer (root : FilePath) (paths : Array FilePath) (general := tr
   let textField (t : Option String) := (t.map fun t => [("text", toJson t)]).getD []
   return {
     analyze := fun path text => do
-      let r ← request ([("path", toJson path.toString)] ++ textField text ++ extra)
+      let r ← request ([("path", toJson path.toString)] ++ textField text)
+      if tacticSaving.isSome && (← IO.ofExcept (r.getObjValAs? Nat "elabErrors")) > 0 then
+        throw <| IO.userError "tactic analysis could not elaborate the original module"
       let findings ← IO.ofExcept (r.getObjValAs? (Array Finding) "findings")
       return { findings, skipped := (r.getObjValAs? Nat "skippedCommands").toOption.getD 0 }
     check := fun path text => do
       let r ← request [("path", toJson path.toString), ("text", toJson text), ("check", true)]
-      return (r.getObjValAs? (Array String) "errors").toOption.getD #[]
+      IO.ofExcept (r.getObjValAs? (Array String) "errors")
     close := do
       stdin.set none  -- the last reference: closes the pipe, and the server exits
       let _ ← child.wait
@@ -448,14 +452,12 @@ def label (path : FilePath) : IO String := do
   return if p.startsWith cwd then (p.drop cwd.length).toString else p
 
 /-- Report and rewrite each file. `verify` elaborates a candidate, throwing on failure. -/
-def runBatch (args : Args) (an : Analyzer) (verify : FilePath → String → IO Unit) : IO UInt32 := do
+def runBatch (paths : Array FilePath) (args : Args) (an : Analyzer)
+    (verify : FilePath → String → IO Unit) : IO UInt32 := do
   let mut failed := 0
   let mut count := 0
   let mut skipped := 0
-  let mut seen : Std.HashSet String := {}
-  for path in ← Project.files args.paths do
-    if seen.contains path.toString then continue
-    seen := seen.insert path.toString
+  for path in paths do
     let lbl ← label path
     try
       let original ← IO.FS.readBinFile path
@@ -765,17 +767,17 @@ unsafe def run (argv : List String) : IO UInt32 := do
     | .error e => IO.eprint usage; IO.eprintln s!"leanperf: error: {e}"; return 2
   try
     if args.dedup || args.tactics then
-      let paths := (← Project.files args.paths).toList.eraseDups.toArray
+      let paths ← Project.files args.paths
       let root ← IO.currentDir
       let an ← if args.tactics then
           elaboratedAnalyzer root paths (jobs := args.jobs)
-            (extra := [("tactics", true), ("minSaving", toJson (args.minSaving * 1000))])
+            (tacticSaving := args.minSaving) (shorter := args.shorter)
         else dedupAnalyzer root paths (args.dedupPass.getD "auto") args.jobs
-      try runBatch args an (skeletonVerify an) finally an.close
+      try runBatch paths args an (skeletonVerify an) finally an.close
     else
       let env ← grammarEnv
       if args.lsp then return ← runServer env args.rules
-      runBatch args (ruleAnalyzer env args.rules) fun p t => discard <| lakeCheck p t
+      runBatch (← Project.files args.paths) args (ruleAnalyzer env args.rules) fun p t => discard <| lakeCheck p t
   catch e =>
     IO.eprintln (toString e)
     return 1

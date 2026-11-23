@@ -44,6 +44,7 @@ def candidates (text : String) : Array String :=
   let only := (r.trimAsciiStart.toString.startsWith "only")
   match h with
   | "nlinarith" => #["linarith" ++ r] ++ (if r.trimAscii.isEmpty then #["positivity"] else #[])
+  | "linarith" => if r.trimAscii.isEmpty then #["assumption"] else #[]
   | "norm_num" => if only then #[] else #["simp" ++ r]
   | "simp" | "simp_all" | "simpa" => if only then #[] else #[h ++ "?" ++ r]
   | _ => #[]
@@ -79,9 +80,23 @@ structure Run where
   goals : List (Expr × List Name)
   suggestions : Array String
 
+/-- Try restricting arithmetic search to the named hypotheses used by the original proof.
+    Dependencies found in the proof term are only a hint; each candidate is replayed. -/
+private def arithmeticSuggestions (tactic : String) (proof : Expr) : MetaM (Array String) := do
+  unless tactic == "linarith" || tactic == "nlinarith" do return #[]
+  let ctx ← getLCtx
+  let used := (collectFVars {} proof).fvarSet
+  let mut names := #[]
+  for d in ctx do
+    unless used.contains d.fvarId && !d.isImplementationDetail && !d.userName.hasMacroScopes do continue
+    unless (ctx.findFromUserName? d.userName).any (·.fvarId == d.fvarId) do continue
+    if ← isProp d.type then names := names.push d.userName.toString
+  let args := " only [" ++ ", ".intercalate names.toList ++ "]"
+  return if tactic == "nlinarith" then #["nlinarith" ++ args, "linarith" ++ args] else #["linarith" ++ args]
+
 /-- Run tactic `text` on `goal`. `budget` is in raw heartbeats; `none` means failure or over budget. -/
 def runOn (ci : ContextInfo) (mctx : MetavarContext) (goal : MVarId) (text : String)
-    (budget : Nat) : IO (Option Run) := do
+    (budget : Nat) (minePremises := false) : IO (Option Run) := do
   let some decl := mctx.findDecl? goal | return none
   let .ok stx := Parser.runParserCategory ci.env `tactic text "<leanperf>" | return none
   ci.runMetaM decl.lctx do
@@ -93,12 +108,13 @@ def runOn (ci : ContextInfo) (mctx : MetavarContext) (goal : MVarId) (text : Str
       let used := (← IO.getNumHeartbeats) - h0
       let msgs := (← Core.getMessageLog).toList
       if msgs.any (·.severity == .error) then return none
-      if (← instantiateMVars (mkMVar goal)).hasSorry then return none
+      let proof ← instantiateMVars (mkMVar goal)
+      if proof.hasSorry then return none
       let mut keys := []
       for g in gs do
         let some k ← goalKey g | return none
         keys := k :: keys
-      let mut sugg := #[]
+      let mut sugg ← if minePremises && gs.isEmpty then arithmeticSuggestions text proof else pure #[]
       for m in msgs do
         if let some s := suggestion? (← m.data.toString) then sugg := sugg.push s
       return some { heartbeats := used, goals := keys.reverse, suggestions := sugg }
@@ -142,7 +158,8 @@ private def trySite (s : Site) (text : String) (budget : Nat)
   for h : k in [:s.runs.size] do
     let (ci, mctx, g) := s.runs[k]
     if budget > 0 && total ≥ budget then return none
-    let some r ← runOn ci mctx g text (if budget == 0 then 0 else budget - total) | return none
+    let some r ← runOn ci mctx g text (if budget == 0 then 0 else budget - total) reference.isNone
+      | return none
     if let some ref := reference then
       unless ref[k]? == some r.goals do return none
     total := total + r.heartbeats
@@ -150,25 +167,27 @@ private def trySite (s : Site) (text : String) (budget : Nat)
     sugg := sugg ++ r.suggestions
   return some (total, goals, sugg)
 
-def tacticEdits (input : String) (map : FileMap) (tree : InfoTree) (minSaving : Nat) :
+def tacticEdits (input : String) (map : FileMap) (tree : InfoTree) (minSaving : Nat) (shorter : Bool) :
     IO (Array Edit) := do
   let mut edits := #[]
   for s in sites input tree do
-    let some (base, ref, _) ← trySite s s.text 0 none | continue
+    let some (base, ref, hints) ← trySite s s.text 0 none | continue
+    if base < minSaving then continue
     let mut best : Option (String × Nat) := none
-    let mut queue := candidates s.text
+    let mut queue := candidates s.text ++ hints
     let mut tried : Array String := #[]
     while let some c := queue.back? do
       queue := queue.pop
       if tried.contains c then continue
       tried := tried.push c
       let isQuery := (head c).endsWith "?"
+      if shorter && !isQuery && c.utf8ByteSize ≥ s.text.utf8ByteSize then continue
       let limit := if isQuery then 0 else (best.map (·.2)).getD base
-      let some (cost, _, sugg) ← trySite s c limit (if isQuery then some ref else some ref)
+      let some (cost, _, sugg) ← trySite s c limit (some ref)
         | continue
       if isQuery then
         queue := queue ++ sugg.filter (· != s.text)
-      else if cost + minSaving ≤ base && best.all (cost < ·.2) then
+      else if cost < base && cost + minSaving ≤ base && best.all (cost < ·.2) then
         best := some (c, cost)
     if let some (c, cost) := best then
       edits := edits.push {
@@ -191,7 +210,7 @@ structure Result where
 
 /-- Elaborate `input` on top of `env` (its imports), collecting edits. -/
 def analyze (env : Environment) (main : Name) (fileName input : String) (opts : Options)
-    (minSaving : Nat := 1000) (tactics options : Bool := true) : IO Result := do
+    (minSaving : Nat := 1000) (tactics options : Bool := true) (shorter := false) : IO Result := do
   let ictx := Parser.mkInputContext input fileName
   let (_, ps0, _) ← Parser.parseHeader ictx
   let mut s := Command.mkState (env.setMainModule main) {} opts
@@ -222,7 +241,7 @@ def analyze (env : Environment) (main : Name) (fileName input : String) (opts : 
       else
         if tactics then
           for t in after.infoState.trees do
-            res := { res with edits := res.edits ++ (← tacticEdits input ictx.fileMap t minSaving) }
+            res := { res with edits := res.edits ++ (← tacticEdits input ictx.fileMap t minSaving shorter) }
         if options then
           if let some (o, inner) := override? cmd then
             let plain := { before with infoState := { enabled := false } }
