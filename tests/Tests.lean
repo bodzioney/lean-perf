@@ -583,6 +583,19 @@ def relationChains : IO Unit := withFixture fun r => do
   check (has t ": A ↔ D := (step.1.trans step.2.symm).trans tail" && has t ": Q := h.2") t
   ok (← sh "lake" #["env", "lean", path.toString] r)
 
+def pruneHaves : IO Unit := withFixture fun r => do
+  let path := r / "Fixture" / "Prune.lean"
+  IO.FS.writeFile path ("axiom Secret : Prop\naxiom secret : Secret\naxiom Goal : Prop\naxiom solve : Secret → Goal\n" ++
+    "theorem pruned : Goal := by\n  have needed : Secret := secret\n" ++
+    "  have unnecessary : True := by\n    exact True.intro\n" ++
+    "  have annotated : True := by /- keep this explanation -/ trivial\n" ++
+    "  apply solve\n  first | assumption | sorry\n")
+  let o ← run #["--compress", "--apply", path.toString] r
+  ok o; hasErr o "unusedHave"
+  let text ← IO.FS.readFile path
+  check (!has text "unnecessary" && has text "have needed" && has text "have annotated") text
+  ok (← sh "lake" #["env", "lean", path.toString] r)
+
 def tests : List (String × IO Unit) := [
   ("checked preview", checkedPreview), ("static apply never loads the project", staticApplyNeverLoadsTheProject),
   ("reflexivity term", reflexivityTerm), ("failed check preserves source", failedCheckPreservesSource),
@@ -600,7 +613,7 @@ def tests : List (String × IO Unit) := [
   ("explicit arithmetic premises", explicitArithmeticPremises),
   ("proof compression", proofCompression),
   ("maximum nonoverlapping savings", overlappingSavings), ("signature compression", signatureCompression),
-  ("local relation chains", relationChains)]
+  ("local relation chains", relationChains), ("prune unused local proofs", pruneHaves)]
 
 def main (args : List String) : IO UInt32 := do
   ok (← sh "lake" #["build", "leanperf"] (← root))

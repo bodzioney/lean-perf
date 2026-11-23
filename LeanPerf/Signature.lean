@@ -44,6 +44,13 @@ private def renderTypes (trees : PersistentArray InfoTree) (range : Syntax.Range
         unless texts.contains t do texts := texts.push t
   return texts
 
+/-- Resolve the newly declared public or private theorem in its original namespace. -/
+def theoremName? (d : Syntax) (before after : Command.State) : Option Name := do
+  let id := d[1][0].getId
+  let full := if id.getRoot == `_root_ then id.replacePrefix `_root_ .anonymous
+    else before.scopes.head!.currNamespace ++ id
+  [full, mkPrivateName after.env full].find? fun n => !before.env.contains n && after.env.contains n
+
 /-- Re-elaborate the proposed declaration in its original scope and require structural equality
     of the exported theorem type, including binder names, plicity and the order of universes. -/
 def compress (input : String) (map : FileMap) (cmd : Syntax) (ctx : Command.Context)
@@ -59,11 +66,7 @@ def compress (input : String) (map : FileMap) (cmd : Syntax) (ctx : Command.Cont
   unless original.contains ".{" || original.contains "DFunLike.coe" || original.contains "Membership.mem" ||
       original.contains "@" do return none
   if original.contains "/-" || original.contains "--" then return none
-  let id := d[1][0].getId
-  let full := if id.getRoot == `_root_ then id.replacePrefix `_root_ .anonymous
-    else before.scopes.head!.currNamespace ++ id
-  let some name := [full, mkPrivateName after.env full].find? (fun n => !before.env.contains n && after.env.contains n)
-    | return none
+  let some name := theoremName? d before after | return none
   let some (.thmInfo old) := after.env.find? name | return none
   let texts ← renderTypes after.infoState.trees r
   let pos := map.toPosition r.start

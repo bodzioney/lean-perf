@@ -1,4 +1,5 @@
 import LeanPerf.ProofCompression
+import LeanPerf.Prune
 import LeanPerf.Signature
 
 /-!
@@ -273,6 +274,10 @@ def analyze (env : Environment) (main : Name) (fileName input : String) (opts : 
           if let some e ← Signature.compress input ictx.fileMap cmd ctx before after then
             res := { res with edits := res.edits.push {
               rule := "shorterSignature", message := "Shorten the theorem statement",
+              range := e.range, newText := e.newText } }
+          if let some e ← Prune.proof? input ictx.fileMap cmd pctx ctx before after then
+            res := { res with edits := res.edits.push {
+              rule := "unusedHave", message := "Remove unused local proofs",
               range := e.range, newText := e.newText } }
         if tactics then
           let mut names : NameSet := {}
