@@ -116,6 +116,9 @@ def runOn (ci : ContextInfo) (mctx : MetavarContext) (goal : MVarId) (text : Str
         let some k ← goalKey g | return none
         keys := k :: keys
       let mut sugg ← if minePremises && gs.isEmpty then arithmeticSuggestions text proof else pure #[]
+      if minePremises && gs.isEmpty && ["linarith", "nlinarith"].contains (head text) then
+        let paths ← Relations.candidates (← instantiateMVars (← goal.getType))
+        sugg := sugg ++ paths.map ("exact " ++ ·)
       for m in msgs do
         if let some s := suggestion? (← m.data.toString) then sugg := sugg.push s
       return some { heartbeats := used, goals := keys.reverse, suggestions := sugg }

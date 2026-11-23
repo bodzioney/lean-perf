@@ -114,6 +114,8 @@ Run `leanperf --compress src/` to preview shorter proofs, or add `--apply` to wr
 
 A bounded structural fingerprint indexes theorem conclusions. Lean checks each proposed term in its local context. When edits overlap, the optimizer chooses the combination that saves the most UTF-8 bytes. It preserves comments inside proof blocks and checks the whole rewritten module. Compression also runs the shorter tactic optimizations. Use `--bench` to measure how the edits affect compilation time.
 
+The optimizer also indexes local equalities, iff statements, and order comparisons by their endpoints, including facts inside conjunctions. It searches chains of up to three local facts, tries symmetry and antisymmetry, and checks the resulting term. For example, with `h₁ : a ≤ b` and `h₂ : b ≤ c`, it can replace a proof of `a ≤ c` with `h₁.trans h₂`. Arithmetic replay also tests these terms against the original tactic's heartbeat count.
+
 For generated theorem statements with explicit universe arguments or coercions, `--compress` tries Lean's mathematical notation and a spelling that omits explicit universe arguments. It re-elaborates the declaration and compares its exported type structurally, including binder names, implicit and instance arguments, and the ordered universe parameters. This preserves named-argument calls from other modules. Statements containing comments keep their original text.
 
 ## Editor integration

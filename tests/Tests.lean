@@ -481,15 +481,15 @@ def arithmeticPremises : IO Unit := withFixture fun r => do
   let path := r / "Fixture" / "Arithmetic.lean"
   -- Stand-ins let this core-only fixture exercise premise discovery and replay. The unused
   -- local must disappear and the longer explicit proof must not hide a shorter alternative.
-  IO.FS.writeFile path ("macro \"nlinarith\" : tactic => `(tactic| first | rfl | rfl | rfl | assumption)\n" ++
-    "macro \"linarith\" : tactic => `(tactic| first | rfl | assumption)\n" ++
-    "macro \"linarith\" \" only \" \"[\" h:ident \"]\" : tactic => `(tactic| exact $h)\n" ++
-    "theorem choose (P Q : Prop) (unused : Q) (needed : P) : P := by nlinarith\n")
+  IO.FS.writeFile path ("macro \"nlinarith\" : tactic => `(tactic| first | rfl | rfl | rfl | exact Or.inl (by assumption))\n" ++
+    "macro \"linarith\" : tactic => `(tactic| first | rfl | exact Or.inl (by assumption))\n" ++
+    "macro \"linarith\" \" only \" \"[\" h:ident \"]\" : tactic => `(tactic| exact Or.inl $h)\n" ++
+    "theorem choose (P Q : Prop) (unused : Q) (needed : P) : P ∨ False := by nlinarith\n")
   let args := #["--tactics", "--min-saving", "0", "--check", path.toString]
   let fastest ← run args r
-  ok fastest; hasOut fastest ": P := by linarith only [needed]\n"
+  ok fastest; hasOut fastest ": P ∨ False := by linarith only [needed]\n"
   let shorter ← run (args.push "--shorter") r
-  ok shorter; hasOut shorter ": P := by linarith\n"
+  ok shorter; hasOut shorter ": P ∨ False := by linarith\n"
 
 def proofCompression : IO Unit := withFixture fun r => do
   let path := r / "Fixture" / "Compress.lean"
@@ -531,6 +531,18 @@ def signatureCompression : IO Unit := withFixture fun r => do
   check (has text comment && !has text "@Eq.{u + 1}") text
   ok (← sh "lake" #["env", "lean", path.toString] r)
 
+def relationChains : IO Unit := withFixture fun r => do
+  let path := r / "Fixture" / "Relations.lean"
+  IO.FS.writeFile path ("theorem chain (A B C D : Prop) (step : (A ↔ B) ∧ (C ↔ B)) (tail : C ↔ D) : A ↔ D := by\n" ++
+    "  constructor\n  · intro a; exact tail.mp (step.2.mpr (step.1.mp a))\n" ++
+    "  · intro d; exact step.1.mpr (step.2.mp (tail.mpr d))\n" ++
+    "theorem takeRight (P Q : Prop) (h : P ∧ Q) : Q := by\n  obtain ⟨_, q⟩ := h\n  exact q\n")
+  let o ← run #["--compress", "--apply", path.toString] r
+  ok o
+  let t ← IO.FS.readFile path
+  check (has t ": A ↔ D := (step.1.trans step.2.symm).trans tail" && has t ": Q := h.2") t
+  ok (← sh "lake" #["env", "lean", path.toString] r)
+
 def tests : List (String × IO Unit) := [
   ("checked preview", checkedPreview), ("static apply never loads the project", staticApplyNeverLoadsTheProject),
   ("reflexivity term", reflexivityTerm), ("failed check preserves source", failedCheckPreservesSource),
@@ -545,7 +557,8 @@ def tests : List (String × IO Unit) := [
   ("language server, syntax pass", lspSyntax), ("language server, elaborated pass", lspElaborated),
   ("cheaper tactics", tactics), ("tactic cache and dependency skeletons", tacticCache),
   ("arithmetic premise selection", arithmeticPremises), ("proof compression", proofCompression),
-  ("maximum nonoverlapping savings", overlappingSavings), ("signature compression", signatureCompression)]
+  ("maximum nonoverlapping savings", overlappingSavings), ("signature compression", signatureCompression),
+  ("local relation chains", relationChains)]
 
 def main (args : List String) : IO UInt32 := do
   ok (← sh "lake" #["build", "leanperf"] (← root))

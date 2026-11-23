@@ -1,4 +1,4 @@
-import Lean
+import LeanPerf.Relations
 
 open Lean Elab Meta
 
@@ -73,6 +73,11 @@ private def suggestion (goal : Expr) (originalProof : Option Expr) (original : S
     MetaM (Option String) := do
   let mut best := none
   let mut bound := original.utf8ByteSize
+  for p in ← Relations.candidates goal do
+    let p := if atomic && p.contains ' ' then "(" ++ p ++ ")" else p
+    if p.utf8ByteSize < bound && (← confirm goal p) then
+      best := some p
+      bound := p.utf8ByteSize
   let mut orientations := #[(goal, none)]
   if let some (rev, symm) := reversed? goal then orientations := orientations.push (rev, some symm)
   let ctx ← getLCtx
