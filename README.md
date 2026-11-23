@@ -108,6 +108,12 @@ The tactic pass builds skeletons only for project modules imported by another ta
 
 Heartbeats measure elaboration. Use `--bench` to measure wall time including kernel checking. `--min-saving N` (default 1) skips edits that save fewer than `N` heartbeats.
 
+## Compressing proofs
+
+Run `leanperf --compress src/` to preview shorter proofs, or add `--apply` to write the checked changes. The pass compares each `by` proof with short representations of the elaborated proof, local hypotheses, earlier theorems in the module, and imported theorems. It also tries using equalities and iff statements in reverse. For example, it can replace an induction proving Gauss's summation formula in reverse with `Eq.symm (Finset.sum_range_id_mul_two n)` when the Mathlib theorem is imported.
+
+A bounded structural fingerprint indexes theorem conclusions. Lean checks each proposed term in its local context. When edits overlap, the optimizer chooses the combination that saves the most UTF-8 bytes. It preserves comments inside proof blocks and checks the whole rewritten module. Compression also runs the shorter tactic optimizations. Use `--bench` to measure how the edits affect compilation time.
+
 ## Editor integration
 
 Start `/absolute/path/to/lean-perf/.lake/build/bin/leanperf --lsp` as an additional language server for Lean files. The server accepts full-document changes over stdio and publishes diagnostics for the current buffer version. The editor can request an individual quick fix or `source.fixAll.leanPerf` for the document. Edits use UTF-16 positions and include the document version when the client supports versioned workspace edits.

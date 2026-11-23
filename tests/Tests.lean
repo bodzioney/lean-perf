@@ -491,6 +491,31 @@ def arithmeticPremises : IO Unit := withFixture fun r => do
   let shorter ← run (args.push "--shorter") r
   ok shorter; hasOut shorter ": P := by linarith\n"
 
+def proofCompression : IO Unit := withFixture fun r => do
+  let path := r / "Fixture" / "Compress.lean"
+  let untouched := "example (P : Prop) (h : P) : P := by /- retain this explanation -/ exact h\n"
+  IO.FS.writeFile path ("axiom Tag : Nat → Prop\naxiom tagWitness (n : Nat) : Tag (n + 1)\n" ++
+    "theorem previous (x : Nat) : Tag (x + 1) := tagWitness x\n" ++
+    "example (y : Nat) : Tag (y + 1) := by\n  have intermediate := tagWitness y\n  exact intermediate\n" ++
+    "example (P Q : Prop) (h : P ↔ Q) : Q ↔ P := by\n  constructor\n  · exact h.mpr\n  · exact h.mp\n" ++
+    "example (P Q : Prop) (h : P) (k : Q) : P ∧ Q := by\n  constructor\n  · exact h\n  · exact k\n" ++ untouched)
+  let o ← run #["--compress", "--apply", path.toString] r
+  ok o; hasErr o "reuseProof"
+  let t ← IO.FS.readFile path
+  check (has t ": Tag (y + 1) := previous y" || has t ": Tag (y + 1) := tagWitness y") t
+  check (has t ": Q ↔ P := Iff.symm h" || has t ": Q ↔ P := h.symm") t
+  check (has t ": P ∧ Q := ⟨h, k⟩" && has t untouched) t
+  ok (← sh "lake" #["env", "lean", path.toString] r)
+
+def overlappingSavings : IO Unit := do
+  let change (a b : Nat) (s : String) : Cli.Finding := {
+    rule := "test", edit := some { range := ⟨⟨0, a⟩, ⟨0, b⟩⟩, newText := s } }
+  let src := "αβγδεζηθ"
+  let outer := change 0 8 "some long text"
+  let inner := #[change 0 4 "a", change 4 8 "b"]
+  check (Cli.rewrite src (inner.push outer) true == ("ab", 2)) "missed disjoint savings"
+  check (Cli.rewrite src (inner.push (change 0 8 "x")) true == ("x", 1)) "missed outer savings"
+
 def tests : List (String × IO Unit) := [
   ("checked preview", checkedPreview), ("static apply never loads the project", staticApplyNeverLoadsTheProject),
   ("reflexivity term", reflexivityTerm), ("failed check preserves source", failedCheckPreservesSource),
@@ -504,7 +529,8 @@ def tests : List (String × IO Unit) := [
   ("check rejects a wrong proof", checkRejectsWrongProof), ("checked apply with a build", checkedApplyWithBuild),
   ("language server, syntax pass", lspSyntax), ("language server, elaborated pass", lspElaborated),
   ("cheaper tactics", tactics), ("tactic cache and dependency skeletons", tacticCache),
-  ("arithmetic premise selection", arithmeticPremises)]
+  ("arithmetic premise selection", arithmeticPremises), ("proof compression", proofCompression),
+  ("maximum nonoverlapping savings", overlappingSavings)]
 
 def main (args : List String) : IO UInt32 := do
   ok (← sh "lake" #["build", "leanperf"] (← root))

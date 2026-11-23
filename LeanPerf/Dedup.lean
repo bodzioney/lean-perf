@@ -463,25 +463,7 @@ def instantiate (x : Name) (pre post : Array Expr) (concl : Expr) : MetaM (Optio
   let intros := (names.extract pre.size names.size).map fun n? => (n?.map toString).getD "_"
   return some s!"by intro {" ".intercalate intros.toList}; exact {term}"
 
-/--
-Elaborate `term` as a proof of `concl`. Called in the context of the proof's binders, under
-their own names, as when the proof is elaborated in its source file.
--/
-def confirm (concl : Expr) (term : String) : MetaM Bool := do
-  let .ok stx := Parser.runParserCategory (← getEnv) `term term | return false
-  let check : TermElabM Bool := do
-    let e ← Term.elabTermEnsuringType stx concl
-    Term.synthesizeSyntheticMVarsNoPostponing
-    let e ← instantiateMVars e
-    return !e.hasMVar && !e.hasSyntheticSorry && (← isDefEq (← inferType e) concl)
-  try
-    withoutModifyingState do
-      modifyThe Core.State fun s => { s with messages := {} }
-      -- Cached instances and unfoldings may come from a larger environment than this one.
-      modifyThe Meta.State fun s => { s with cache := {} }
-      let ok ← check.run' {} {}
-      return ok && !(← getThe Core.State).messages.hasErrors
-  catch _ => return false
+abbrev confirm := ProofCompression.confirm
 
 /--
 Run `x` with a fresh heartbeat budget, treating exhaustion as failure. Heartbeat exhaustion is a
@@ -649,6 +631,7 @@ private structure Context where
   options : Array String
   base : Environment
   index : IO.Ref (Option ImportedIndex)
+  proofIndex : IO.Ref (Option ProofCompression.Index)
 
 private def worker (context : IO.Ref (Option Context)) (dir : FilePath) (query : Bool) : IO Unit := do
   let job : Build.Job ← Build.readJson (dir / "job.json")
@@ -667,14 +650,22 @@ private def worker (context : IO.Ref (Option Context)) (dir : FilePath) (query :
     c.isModule == hdr.isModule && c.deps == deps && c.options == job.options
   let ctx ← cached.getDM do
     let c := { imports := hdr.imports, isModule := hdr.isModule, deps, options := job.options,
-               base := ← baseEnv job input opts, index := ← IO.mkRef none : Context }
+               base := ← baseEnv job input opts, index := ← IO.mkRef none, proofIndex := ← IO.mkRef none : Context }
     context.set (some c)
     return c
   let base := ctx.base.setMainModule job.mod
   if tactics then
     let minSaving := (req.getObjValAs? Nat "minSaving").toOption.getD 1000
+    let compression ← if (req.getObjValAs? Bool "compress").toOption.getD false then do
+        let idx ← (← ctx.proofIndex.get).getDM do
+          let idx := ProofCompression.importIndex ctx.base
+          ctx.proofIndex.set (some idx)
+          return idx
+        pure (some idx)
+      else pure none
     let r ← Tactics.analyze base job.mod job.source.toString input opts minSaving
       (shorter := (req.getObjValAs? Bool "shorter").toOption.getD false)
+      (compression := compression)
     let findings := r.edits.map fun e =>
       { rule := e.rule, message := e.message, lemma := "", range := e.range
         edit := some { range := e.range, newText := e.newText } : Finding }
@@ -799,7 +790,8 @@ private unsafe def answer (slot : Build.Slot) (w : Workspace) (m : Name) (req : 
   -- publication. The job key already covers the source, imports, options and executable.
   let minSaving := (req.getObjValAs? Nat "minSaving").toOption.getD 1000
   let shorter := (req.getObjValAs? Bool "shorter").toOption.getD false
-  let tacticReport := w.cache / "tactics" / s!"{job.dir.fileName.get!}-{minSaving}-{shorter}.json"
+  let compress := (req.getObjValAs? Bool "compress").toOption.getD false
+  let tacticReport := w.cache / "tactics" / s!"{job.dir.fileName.get!}-{minSaving}-{shorter}-{compress}.json"
   let cacheTactics := tactics && !checking && saved
   if cacheTactics && (← tacticReport.pathExists) then return ← Build.readJson tacticReport
   if saved && !raw && (← resultFile.pathExists) then
@@ -862,8 +854,9 @@ Run from the target Lake project. Reports checked proof terms and their location
   let root ← IO.FS.realPath root
   let batch := cmd == "--configured" && !rest.contains "--serve"
   let buildOnly := rest.contains "--build-only"
-  let shorter := rest.contains "--shorter"
-  let tactics := rest.contains "--tactics"
+  let compress := rest.contains "--compress"
+  let shorter := compress || rest.contains "--shorter"
+  let tactics := compress || rest.contains "--tactics"
   let mut minSaving := 1000
   let cache : System.FilePath := (← IO.getEnv "LEANPERF_CACHE_DIR").map System.FilePath.mk
     |>.getD ((← IO.currentDir) / ".lake" / "leanperf")
@@ -871,7 +864,7 @@ Run from the target Lake project. Reports checked proof terms and their location
   let mut files : Array System.FilePath := #[]
   let mut workers := (← IO.getEnv "LEANPERF_JOBS").getD "2"
   for a in rest do
-    if ["--serve", "--build-only", "--shorter", "--tactics"].contains a then continue
+    if ["--serve", "--build-only", "--shorter", "--tactics", "--compress"].contains a then continue
     if let some n := a.dropPrefix? "--min-saving=" then
       minSaving := (n.toString.toNat?.getD 1) * 1000
       continue
@@ -892,12 +885,13 @@ Run from the target Lake project. Reports checked proof terms and their location
     return 0
   let mut world ← prepare root cache files options jobs tactics
   let slot ← IO.mkRef none
+  let tacticConfig := Json.mkObj [("tactics", true), ("minSaving", minSaving),
+    ("shorter", shorter), ("compress", compress)]
   if batch && tactics then
     let mut failed := 0
     for path in files do
       let m := Build.moduleOf root path
-      let req := Json.mkObj [("path", path.toString), ("tactics", true), ("minSaving", minSaving),
-        ("shorter", shorter)]
+      let req := tacticConfig.setObjVal! "path" path.toString
       let r : Report ← IO.ofExcept (fromJson? (← answer slot world m req))
       for f in r.findings do
         IO.println s!"{path}:{f.range.start.line + 1}:{f.range.start.character + 1}: {f.rule}: {f.message}"
@@ -935,8 +929,7 @@ Run from the target Lake project. Reports checked proof terms and their location
         files := files.push path
         world ← prepare root cache files options jobs tactics
       let req := if tactics && !(req.getObjValAs? Bool "check").toOption.getD false then
-        req.setObjVal! "tactics" true |>.setObjVal! "minSaving" (toJson minSaving)
-          |>.setObjVal! "shorter" (toJson shorter)
+        req.mergeObj tacticConfig
         else req
       answer slot world m req
     catch e => pure (Json.mkObj [("error", toString e)])

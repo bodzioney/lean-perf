@@ -122,7 +122,7 @@ def syntaxAnalyzer (root : FilePath) (paths : Array FilePath) : IO Analyzer := d
 
 /-- This executable under `lake env` in the target project, answering one JSON request per line. -/
 def elaboratedAnalyzer (root : FilePath) (paths : Array FilePath) (general := true)
-    (jobs : Option Nat := none) (tacticSaving : Option Nat := none) (shorter := false) : IO Analyzer := do
+    (jobs : Option Nat := none) (tacticSaving : Option Nat := none) (shorter compress := false) : IO Analyzer := do
   if let some r ← toolchainMismatch root then
     throw <| IO.userError s!"cannot elaborate the project: {r}"
   let (h, listing) ← IO.FS.createTempFile
@@ -131,6 +131,7 @@ def elaboratedAnalyzer (root : FilePath) (paths : Array FilePath) (general := tr
   let args := #["--project", "--serve"] ++ (if general then #[] else #["--no-general"]) ++
     (tacticSaving.map (fun n => #["--tactics", s!"--min-saving={n}"])).getD #[] ++
     (if shorter then #["--shorter"] else #[]) ++
+    (if compress then #["--compress"] else #[]) ++
     (jobs.map (#[s!"--jobs={·}"])).getD #[] ++ #[s!"--file-list={listing}"]
   let child ← IO.Process.spawn { cmd := (← IO.appPath).toString, args, cwd := root,
                                  stdin := .piped, stdout := .piped, stderr := .inherit }
@@ -203,24 +204,59 @@ def independent (fs : Array Finding) : Array Finding := Id.run do
       first := false
   return out
 
-/-- Apply independent edits; with `shorter`, only those that shrink the source. -/
+private structure SourceEdit where
+  start : String.Pos.Raw
+  stop : String.Pos.Raw
+  text : String
+  deriving Inhabited
+
+private def SourceEdit.saving (e : SourceEdit) : Nat :=
+  e.stop.byteIdx - e.start.byteIdx - e.text.utf8ByteSize
+
+/-- Weighted interval scheduling. Combining disjoint edits inside a proof can save more than
+    replacing the entire proof. Score actual UTF-8 bytes after newline conversion. -/
+private def smallestSource (edits : Array SourceEdit) : Array SourceEdit := Id.run do
+  let sorted := (edits.filter (·.saving > 0)).qsort fun a b =>
+    a.stop < b.stop || (a.stop == b.stop && (a.start < b.start || (a.start == b.start && a.text < b.text)))
+  let mut scores := #[0]
+  let mut choices : Array (Option Nat) := #[]
+  for h : i in [:sorted.size] do
+    let e := sorted[i]
+    let mut lo := 0
+    let mut hi := i
+    while lo < hi do
+      let mid := (lo + hi) / 2
+      if sorted[mid]!.stop ≤ e.start then lo := mid + 1 else hi := mid
+    let saving := scores[lo]! + e.saving
+    let take := saving > scores.back!
+    choices := choices.push (if take then some lo else none)
+    scores := scores.push (max scores.back! saving)
+  let mut n := sorted.size
+  let mut selected := #[]
+  while n > 0 do
+    n := n - 1
+    if let some prev := choices[n]! then
+      selected := selected.push sorted[n]!
+      n := prev
+  return selected.reverse
+
 def rewrite (text : String) (fs : Array Finding) (shorter := false) : String × Nat := Id.run do
   let map := FileMap.ofString text
-  let lines := text.splitOn "\n"
-  let mut out := ""
-  let mut cursor : String.Pos.Raw := 0
-  let mut count := 0
-  for f in independent fs do
-    let some e := f.edit | continue
-    let a := map.lspPosToUtf8Pos e.range.start
-    let b := map.lspPosToUtf8Pos e.range.end
+  let lines := (text.splitOn "\n").toArray
+  let candidates := if shorter then fs else independent fs
+  let edits := candidates.filterMap fun f => do
+    let e ← f.edit
+    let span := map.lspRangeToUtf8Range e.range
     let crlf := (lines[e.range.start.line]?.getD "").endsWith "\r"
     let new := if crlf then "\r\n".intercalate (e.newText.splitOn "\n") else e.newText
-    if shorter && new.utf8ByteSize ≥ b.byteIdx - a.byteIdx then continue
-    count := count + 1
-    out := out ++ String.Pos.Raw.extract text cursor a ++ new
-    cursor := b
-  return (out ++ String.Pos.Raw.extract text cursor text.rawEndPos, count)
+    return { start := span.start, stop := span.stop, text := new : SourceEdit }
+  let edits := if shorter then smallestSource edits else edits
+  let mut out := ""
+  let mut cursor : String.Pos.Raw := 0
+  for e in edits do
+    out := out ++ String.Pos.Raw.extract text cursor e.start ++ e.text
+    cursor := e.stop
+  return (out ++ String.Pos.Raw.extract text cursor text.rawEndPos, edits.size)
 
 /-! ## Unified diffs (Myers), formatted as Python's `difflib.unified_diff` -/
 
@@ -367,11 +403,12 @@ structure Args where
   jobs : Option Nat := none
   shorter := false
   tactics := false
+  compress := false
   minSaving : Nat := 1
 
 def usage : String :=
   "usage: leanperf [--lsp] [--rules R,…] [--apply] [--check] [--bench N] [--dedup] " ++
-  "[--dedup-pass {auto,syntax,elaborate}] [--tactics] [--min-saving N] [--jobs N] [--shorter] [paths …]
+  "[--dedup-pass {auto,syntax,elaborate}] [--tactics] [--compress] [--min-saving N] [--jobs N] [--shorter] [paths …]
 
 A Lean proof linter, batch rewriter and LSP server.
 
@@ -387,6 +424,7 @@ A Lean proof linter, batch rewriter and LSP server.
   --tactics        replace tactics with cheaper ones that close the same goals, and drop
                    `set_option … in` overrides a command does not need (elaborates the target)
   --min-saving N   with --tactics, the smallest saving worth an edit, in heartbeats (default 1)
+  --compress       replace tactic proofs with shorter local or library proofs; implies --tactics --shorter --check
   --jobs N         parallel elaborated skeleton workers (default 2)
   --shorter        select only replacements that shrink the source in UTF-8
 "
@@ -412,6 +450,7 @@ def parseArgs (argv : List String) : Except String Args := do
     | "--dedup" => a := { a with dedup := true }
     | "--shorter" => a := { a with shorter := true }
     | "--tactics" => a := { a with tactics := true }
+    | "--compress" => a := { a with tactics := true, shorter := true, check := true, compress := true }
     | "--rules" => let (v, r) ← take; rest := r; a := { a with rules := v.splitOn "," }
     | "--bench" =>
       let (v, r) ← take; rest := r
@@ -771,7 +810,7 @@ unsafe def run (argv : List String) : IO UInt32 := do
       let root ← IO.currentDir
       let an ← if args.tactics then
           elaboratedAnalyzer root paths (jobs := args.jobs)
-            (tacticSaving := args.minSaving) (shorter := args.shorter)
+            (tacticSaving := args.minSaving) (shorter := args.shorter) (compress := args.compress)
         else dedupAnalyzer root paths (args.dedupPass.getD "auto") args.jobs
       try runBatch paths args an (skeletonVerify an) finally an.close
     else

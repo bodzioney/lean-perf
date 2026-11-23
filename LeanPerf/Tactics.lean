@@ -1,4 +1,4 @@
-import Lean
+import LeanPerf.ProofCompression
 
 /-!
 # Cheaper tactics and unneeded option overrides
@@ -210,12 +210,14 @@ structure Result where
 
 /-- Elaborate `input` on top of `env` (its imports), collecting edits. -/
 def analyze (env : Environment) (main : Name) (fileName input : String) (opts : Options)
-    (minSaving : Nat := 1000) (tactics options : Bool := true) (shorter := false) : IO Result := do
+    (minSaving : Nat := 1000) (tactics options : Bool := true) (shorter := false)
+    (compression : Option ProofCompression.Index := none) : IO Result := do
   let ictx := Parser.mkInputContext input fileName
   let (_, ps0, _) ← Parser.parseHeader ictx
   let mut s := Command.mkState (env.setMainModule main) {} opts
   let mut ps := ps0
   let mut res : Result := {}
+  let mut localProofs : ProofCompression.Index := {}
   repeat
     let scope := s.scopes.head!
     let pctx : Parser.ParserModuleContext :=
@@ -240,8 +242,17 @@ def analyze (env : Environment) (main : Name) (fileName input : String) (opts : 
             res := { res with errors := res.errors.push s!"{m.pos.line}:{m.pos.column + 1}: {← m.data.toString}" }
       else
         if tactics then
+          let mut names : NameSet := {}
           for t in after.infoState.trees do
             res := { res with edits := res.edits ++ (← tacticEdits input ictx.fileMap t minSaving shorter) }
+            if let some imports := compression then
+              let (edits, decls) ← ProofCompression.scan input ictx.fileMap t imports localProofs
+              names := names.merge decls
+              for e in edits do
+                res := { res with edits := res.edits.push {
+                  rule := "reuseProof", message := s!"Reuse {e.newText}",
+                  range := e.range, newText := e.newText } }
+          if compression.isSome then localProofs := ProofCompression.addDecls localProofs after.env names
         if options then
           if let some (o, inner) := override? cmd then
             let plain := { before with infoState := { enabled := false } }
