@@ -45,7 +45,7 @@ def candidates (text : String) : Array String :=
   let only := (r.trimAsciiStart.toString.startsWith "only")
   match h with
   | "nlinarith" => #["linarith" ++ r] ++ (if r.trimAscii.isEmpty then #["positivity"] else #[])
-  | "linarith" => if r.trimAscii.isEmpty then #["assumption"] else #[]
+  | "linarith" => if r.trimAscii.isEmpty || r.trimAsciiStart.startsWith "[" then #["assumption"] else #[]
   | "norm_num" => if only then #[] else #["simp" ++ r]
   | "simp" | "simp_all" | "simpa" => if only then #[] else #[h ++ "?" ++ r]
   | _ => #[]
@@ -83,8 +83,24 @@ structure Run where
 
 /-- Try restricting arithmetic search to the named hypotheses used by the original proof.
     Dependencies found in the proof term are only a hint; each candidate is replayed. -/
-private def arithmeticSuggestions (tactic : String) (proof : Expr) : MetaM (Array String) := do
+private def arithmeticSuggestions (text : String) (stx : Syntax) (proof : Expr) : MetaM (Array String) := do
+  let tactic := head text
   unless tactic == "linarith" || tactic == "nlinarith" do return #[]
+  let suffix := (rest text).trimAscii.toString
+  let mut explicit := #[]
+  unless suffix.isEmpty do
+    -- Locate the original bracket group in the parsed tactic. An argument can itself contain
+    -- commas, nested brackets or an entire proof. Slice complete terms by their source ranges.
+    let some group := stx.find? fun node => Id.run do
+      let n := node.getNumArgs
+      if n < 3 || node[n-3].getAtomVal != "[" || node[n-1].getAtomVal != "]" then return false
+      let some start := node[n-3].getPos? | return false
+      let some stop := node[n-1].getTailPos? | return false
+      return String.Pos.Raw.extract text start stop == suffix
+      | return #[]
+    for arg in group[group.getNumArgs-2].getSepArgs do
+      let some r := arg.getRange? | return #[]
+      explicit := explicit.push (String.Pos.Raw.extract text r.start r.stop)
   let ctx ← getLCtx
   let used := (collectFVars {} proof).fvarSet
   let mut names := #[]
@@ -92,8 +108,15 @@ private def arithmeticSuggestions (tactic : String) (proof : Expr) : MetaM (Arra
     unless used.contains d.fvarId && !d.isImplementationDetail && !d.userName.hasMacroScopes do continue
     unless (ctx.findFromUserName? d.userName).any (·.fvarId == d.fvarId) do continue
     if ← isProp d.type then names := names.push d.userName.toString
-  let args := " only [" ++ ", ".intercalate names.toList ++ "]"
-  return if tactic == "nlinarith" then #["nlinarith" ++ args, "linarith" ++ args] else #["linarith" ++ args]
+  let restricted (hs : Array String) := Id.run do
+    let args := " only [" ++ ", ".intercalate hs.toList ++ "]"
+    return if tactic == "nlinarith" then #["nlinarith" ++ args, "linarith" ++ args] else #["linarith" ++ args]
+  let mut hints := restricted names
+  unless explicit.isEmpty do
+    hints := hints ++ restricted explicit
+    let combined := names ++ explicit.filter (!names.contains ·)
+    unless combined == names || combined == explicit do hints := hints ++ restricted combined
+  return hints
 
 /-- Run tactic `text` on `goal`. `budget` is in raw heartbeats; `none` means failure or over budget. -/
 def runOn (ci : ContextInfo) (mctx : MetavarContext) (goal : MVarId) (text : String)
@@ -115,7 +138,7 @@ def runOn (ci : ContextInfo) (mctx : MetavarContext) (goal : MVarId) (text : Str
       for g in gs do
         let some k ← goalKey g | return none
         keys := k :: keys
-      let mut sugg ← if minePremises && gs.isEmpty then arithmeticSuggestions text proof else pure #[]
+      let mut sugg ← if minePremises && gs.isEmpty then arithmeticSuggestions text stx proof else pure #[]
       if minePremises && gs.isEmpty && ["linarith", "nlinarith"].contains (head text) then
         let paths ← Relations.candidates (← instantiateMVars (← goal.getType))
         sugg := sugg ++ paths.map ("exact " ++ ·)
@@ -175,6 +198,7 @@ def tacticEdits (input : String) (map : FileMap) (tree : InfoTree) (minSaving : 
     IO (Array Edit) := do
   let mut edits := #[]
   for s in sites input tree do
+    if s.text.contains "/-" || s.text.contains "--" then continue
     let some (base, ref, hints) ← trySite s s.text 0 none | continue
     if base < minSaving then continue
     let mut best : Option (String × Nat) := none

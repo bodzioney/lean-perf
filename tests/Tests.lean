@@ -491,6 +491,20 @@ def arithmeticPremises : IO Unit := withFixture fun r => do
   let shorter ← run (args.push "--shorter") r
   ok shorter; hasOut shorter ": P ∨ False := by linarith\n"
 
+def explicitArithmeticPremises : IO Unit := withFixture fun r => do
+  let path := r / "Fixture" / "Explicit.lean"
+  let commented := "example : Picked (3, 4) := by nlinarith [picked /- keep -/ (3, 4)]\n"
+  IO.FS.writeFile path ("axiom Picked : Nat × Nat → Prop\naxiom picked (p : Nat × Nat) : Picked p\n" ++
+    "syntax \"nlinarith\" \"[\" term,* \"]\" : tactic\n" ++
+    "macro_rules | `(tactic| nlinarith [$h:term]) => `(tactic| first | rfl | rfl | rfl | exact $h)\n" ++
+    "syntax \"linarith\" \"only\" \"[\" term,* \"]\" : tactic\n" ++
+    "macro_rules | `(tactic| linarith only [$h:term]) => `(tactic| exact $h)\n" ++
+    "example : Picked (1, 2) := by nlinarith [picked (1, 2)]\n" ++ commented)
+  let o ← run #["--tactics", "--min-saving", "0", "--check", "--apply", path.toString] r
+  ok o
+  let rewritten ← IO.FS.readFile path
+  check (has rewritten "by linarith only [picked (1, 2)]\n" && has rewritten commented) rewritten
+
 def proofCompression : IO Unit := withFixture fun r => do
   let path := r / "Fixture" / "Compress.lean"
   let untouched := "example (P : Prop) (h : P) : P := by /- retain this explanation -/ exact h\n"
@@ -556,7 +570,8 @@ def tests : List (String × IO Unit) := [
   ("check rejects a wrong proof", checkRejectsWrongProof), ("checked apply with a build", checkedApplyWithBuild),
   ("language server, syntax pass", lspSyntax), ("language server, elaborated pass", lspElaborated),
   ("cheaper tactics", tactics), ("tactic cache and dependency skeletons", tacticCache),
-  ("arithmetic premise selection", arithmeticPremises), ("proof compression", proofCompression),
+  ("arithmetic premise selection", arithmeticPremises), ("explicit arithmetic premises", explicitArithmeticPremises),
+  ("proof compression", proofCompression),
   ("maximum nonoverlapping savings", overlappingSavings), ("signature compression", signatureCompression),
   ("local relation chains", relationChains)]
 

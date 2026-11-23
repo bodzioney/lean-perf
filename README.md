@@ -94,7 +94,7 @@ For both passes, a restatement that the theorem cannot cite, because its module 
 
 ## Cheaper tactics
 
-`--tactics` replays alternative tactics on the goals where the original tactic ran. For a bare `linarith` or `nlinarith`, it reads the local hypotheses used by the original proof term and tries restricting arithmetic search to those hypotheses with `only [...]`. It also tries `linarith` and `positivity` for `nlinarith`, `simp` for `norm_num`, and the explicit simplification suggested by `simp?`, `simp_all?` or `simpa?`.
+`--tactics` replays alternative tactics on the goals where the original tactic ran. For `linarith` and `nlinarith`, it reads the hypotheses used by the original proof term and tries restricting arithmetic search to them with `only [...]`. When the tactic supplies extra premises, it tries those terms on their own and combined with the inferred hypotheses. It also tries `linarith` and `positivity` for `nlinarith`, `simp` for `norm_num`, and the explicit simplification suggested by `simp?`, `simp_all?` or `simpa?`.
 
 A candidate must leave the same goals on every replay, introduce no errors or `sorry`, and use fewer heartbeats in total. Goals are compared as closed terms with their hypothesis names. With `--shorter`, the pass selects the cheapest successful candidate that also reduces the source byte count. The pass also tries deleting scoped overrides of `maxHeartbeats`, `synthInstance.maxHeartbeats`, `maxRecDepth`, `synthInstance.maxSize` and the supported `backward.isDefEq` options, checking whether the command still elaborates.
 
