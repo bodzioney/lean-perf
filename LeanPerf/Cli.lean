@@ -126,12 +126,16 @@ def syntaxAnalyzer (root : FilePath) (paths : Array FilePath) : IO Analyzer := d
     check := fun _ _ => throw <| IO.userError "the syntactic pass suggests no proofs to check" }
 
 /-- Unused theorems of `paths`, from the source text of every module under the project's `srcDir`. -/
-def unusedAnalyzer (root : FilePath) (paths : Array FilePath) : IO Analyzer := do
+def unusedAnalyzer (root : FilePath) (paths : Array FilePath) (roots : Array String := #[]) : IO Analyzer := do
   let src ← IO.FS.realPath (← srcDir root)
   let all ← Project.files #[src]
   let files ← all.mapM fun p => return Unused.parse p (SyntaxDedup.moduleName src p) (← IO.FS.readFile p)
+  -- A root that names nothing would leave every theorem unused.
+  for r in roots do
+    unless files.any (·.commands.any fun c => c.«theorem».isSome && Unused.names c.full r) do
+      throw <| IO.userError s!"--root {r} names no theorem of the project"
   let targets ← paths.mapM fun p => return (← IO.FS.realPath p).toString
-  let found := Unused.analyze files (Std.HashSet.ofArray targets)
+  let found := Unused.analyze files (Std.HashSet.ofArray targets) roots
   return {
     analyze := fun path text => do
       let some text := text | return {}
@@ -139,7 +143,8 @@ def unusedAnalyzer (root : FilePath) (paths : Array FilePath) : IO Analyzer := d
       let chars := text.toList.toArray
       return { findings := cmds.map fun (_, c) =>
         let range : Lsp.Range := ⟨SyntaxDedup.lspPos chars c.lead, SyntaxDedup.lspPos chars c.stop⟩
-        { rule := "unusedTheorem", message := some s!"{c.name} is not mentioned anywhere else in the project",
+        { rule := "unusedTheorem", message := some (if roots.isEmpty then s!"{c.name} is not mentioned anywhere else in the project"
+            else s!"{c.name} is not needed for {", ".intercalate roots.toList}"),
           range := some range, edit := some { range, newText := "" } } }
     check := fun _ _ => pure #[] }
 
@@ -442,15 +447,19 @@ structure Args where
   speed := false
   compress := false
   cosmetic := false
+  /-- With `--stage`, the stages whose proof lints run. -/
+  stages : List Lints.Stage := []
+  /-- With `--root`, the theorems the project is for: `--unused` deletes every theorem they do not need. -/
+  roots : Array String := #[]
   unused := false
   layout := false
   propose : Option String := none
   minSaving : Nat := 1
 
 def usage : String :=
-  "usage: leanperf --golf [--cosmetic] [--strip-comments] [--keep-unused] [--no-optimize] [--speed] [--rounds N] [--jobs N] paths …\n" ++
+  "usage: leanperf --golf [--root T,…] [--cosmetic] [--strip-comments] [--keep-unused] [--no-optimize] [--speed] [--rounds N] [--jobs N] paths …\n" ++
   "       leanperf [--lsp] [--rules R,…] [--apply] [--check] [--bench N] [--dedup] " ++
-  "[--dedup-pass {auto,syntax,elaborate}] [--tactics] [--compress] [--cosmetic] [--unused] [--layout] [--propose CMD] " ++
+  "[--dedup-pass {auto,syntax,elaborate}] [--tactics] [--compress] [--cosmetic] [--stage S,…] [--unused] [--layout] [--propose CMD] " ++
   "[--min-saving N] [--jobs N] " ++
   "[--shorter] [paths …]
 
@@ -478,8 +487,12 @@ A Lean proof linter, batch rewriter and LSP server.
   --compress       take tactic steps and declarations out of proofs, each edit checked; implies
                    --shorter --check. Add --tactics for the lints that make tactics cheaper
   --cosmetic       with --compress, also the lints that only save bytes, such as shorter names
+  --stage S,…      the proof lints of these pipeline stages: cut (delete what is not needed),
+                   compress (fewer steps and declarations), optimize (cheaper tactics)
   --unused         delete theorems that nothing else in the project mentions, reading only
                    source text; run from the project root
+  --root T,…       with --unused or --golf, the theorems the project is for: delete every theorem
+                   they do not need, including the results of modules nothing imports
   --layout         join lines that fit within 100 columns when the command parses the same
                    (with --rules stripComments,joinLines, also delete comments inside declarations)
   --propose CMD    send each theorem to the shell command CMD and keep the shortest rewrite it
@@ -512,6 +525,16 @@ def parseArgs (argv : List String) : Except String Args := do
     | "--shorter" => a := { a with shorter := true }
     | "--tactics" => a := { a with tactics := true, speed := true }
     | "--cosmetic" => a := { a with cosmetic := true }
+    | "--root" => let (v, r) ← take; rest := r; a := { a with roots := a.roots ++ (v.splitOn ",").toArray }
+    | "--stage" =>
+      let (v, r) ← take
+      rest := r
+      let stages ← (v.splitOn ",").mapM fun
+        | "cut" => pure Lints.Stage.cut
+        | "compress" => pure .compress
+        | "optimize" => pure .optimize
+        | x => throw s!"unknown stage {x}: cut, compress or optimize"
+      a := { a with stages, tactics := true, shorter := true, check := true, compress := true }
     | "--compress" => a := { a with tactics := true, shorter := true, check := true, compress := true }
     | "--unused" => a := { a with unused := true }
     | "--layout" => a := { a with layout := true }
@@ -562,9 +585,14 @@ def parseArgs (argv : List String) : Except String Args := do
     else if a.propose.isSome then Lints.names "propose"
     else ruleNames
   -- `--compress` takes steps and declarations out of proofs. Lints that only save bytes wait for
-  -- `--cosmetic`, and those that make tactics cheaper for `--tactics`.
+  -- `--cosmetic`, and those that make tactics cheaper for `--tactics`. `--stage` picks lints by
+  -- their stage in the pipeline instead.
+  let staged (n : String) := match Lints.find? n with
+    | some l => a.stages.contains l.stage
+    | none => false
   let wanted := selected.getD (available.filter fun n => !Lints.optIn.contains n &&
-    (a.cosmetic || !Lints.cosmetic.contains n) && !(a.compress && !a.speed && (Lints.names "tactics").contains n))
+    (a.cosmetic || !Lints.cosmetic.contains n) &&
+    (if a.stages.isEmpty then !(a.compress && !a.speed && (Lints.names "tactics").contains n) else staged n))
   unless (wanted ++ allowed).all available.contains do
     throw s!"available lints in this mode: {", ".intercalate available}"
   return { a with rules := available.filter fun r => wanted.contains r && !allowed.contains r }
@@ -901,12 +929,12 @@ def runServer (env : Environment) (rules : List String) : IO UInt32 := do
 
 /-! ## Entry point -/
 
-/-- `leanperf --golf PATHS`: every pass that shrinks proofs, in the order that lets each feed the
-    next. Theorems that nothing uses go first, so that no later pass works on them and more helpers
-    have one user to fold into; then duplicates cite the theorem they restate; then rounds of
-    `--unused` and `--compress` take steps and declarations out of proofs until a round changes
-    nothing; and last `--tactics` makes the remaining steps cheaper. Each pass is this program run
-    again, and writes only edits that Lean has checked. -/
+/-- `leanperf --golf PATHS`: the pipeline that shrinks proofs, in three stages. Cut deletes what
+    nothing needs, so that no later pass works on it and more helpers are left with one user to fold
+    into: theorems that nothing uses, then duplicates, which cite the theorem they restate. Compress
+    rewrites proofs in fewer steps and declarations, in rounds with the cuts inside proofs that each
+    rewrite can expose, until a round changes nothing. Optimize makes the remaining steps cheaper.
+    Each pass is this program run again, and writes only edits that Lean has checked. -/
 def golf (argv : List String) : IO UInt32 := do
   let mut cosmetic := false
   let mut strip := false
@@ -925,7 +953,7 @@ def golf (argv : List String) : IO UInt32 := do
     | "--keep-unused" => unused := false
     | "--no-optimize" => optimize := false
     | "--speed" => speed := true
-    | "--rounds" | "--jobs" =>
+    | "--rounds" | "--jobs" | "--root" =>
       let v :: r := rest | IO.eprintln s!"leanperf: error: {a} needs a value"; return 2
       rest := r
       if a == "--rounds" then rounds := v.toNat! else extra := extra ++ #[a, v]
@@ -962,34 +990,37 @@ def golf (argv : List String) : IO UInt32 := do
     let (n, f) ← pass #["--layout", "--rules", "stripComments,joinLines", "--apply", "--check"]
     failed := failed || f
     IO.println s!"comments: {n} edits, {← size} bytes"
-  if unused then
-    let (n, f) ← pass #["--unused", "--check", "--apply"]
-    failed := failed || f
-    IO.println s!"unused theorems: {n} edits, {← size} bytes"
-  let (n, f) ← pass #["--dedup", "--check", "--apply"]
+  -- Cut: what nothing needs goes before anything works on it.
+  let (u, f) ← if unused then pass #["--unused", "--check", "--apply"] else pure (0, false)
   failed := failed || f
-  IO.println s!"duplicates: {n} edits, {← size} bytes"
+  let (d, f) ← pass #["--dedup", "--check", "--apply"]
+  failed := failed || f
+  IO.println s!"cut: {u} unused theorems, {d} duplicates, {← size} bytes"
+  -- Compress, with the cuts inside proofs that each rewrite can expose, until nothing changes.
   for i in [1:rounds + 1] do
     let (u, f) ← if unused && i > 1 then pass #["--unused", "--check", "--apply"] else pure (0, false)
     failed := failed || f
-    let (c, f) ← pass (#["--compress", "--apply"] ++ (if cosmetic then #["--cosmetic"] else #[]))
+    let (c, f) ← pass (#["--stage", "cut,compress", "--apply"] ++ (if cosmetic then #["--cosmetic"] else #[]))
     failed := failed || f
     let (l, f) ← if cosmetic then pass #["--layout", "--apply", "--check"] else pure (0, false)
     failed := failed || f
-    IO.println s!"round {i}: {u} unused, {c} compress and {l} layout edits, {← size} bytes"
+    IO.println s!"compress round {i}: {c} edits, {u} unused theorems, {l} layout edits, {← size} bytes"
     if u + c + l == 0 then break
+  -- Optimize: cheaper tactics that add no bytes, unless speed matters more than size.
   if optimize then
-    -- Cheaper tactics that add no bytes, unless speed matters more than size.
-    let (n, f) ← pass (#["--tactics", "--apply", "--check"] ++ (if speed then #[] else #["--shorter"]))
+    let (n, f) ← pass (if speed then #["--tactics", "--apply", "--check"] else #["--stage", "optimize", "--apply"])
     failed := failed || f
-    IO.println s!"cheaper tactics: {n} edits, {← size} bytes"
+    IO.println s!"optimize: {n} edits, {← size} bytes"
   IO.println s!"end: {describe (← counts) (← size)} (from {describe before bytes0})"
   return if failed then 1 else 0
 
 unsafe def run (argv : List String) : IO UInt32 := do
   if argv.contains "--golf" then return ← golf argv
   if argv == ["--list-lints"] then
-    for lint in Lints.catalog do IO.println s!"{lint.name}\t{lint.group}\t{lint.description}"
+    for lint in Lints.catalog do
+      let stage := match lint.stage with
+        | .cut => "cut" | .compress => "compress" | .optimize => "optimize" | .layout => "layout" | .none => "-"
+      IO.println s!"{lint.name}\t{lint.group}\t{stage}{if lint.cosmetic then " (cosmetic)" else ""}\t{lint.description}"
     return 0
   let args ← match parseArgs argv with
     | .ok a => pure a
@@ -998,7 +1029,7 @@ unsafe def run (argv : List String) : IO UInt32 := do
   try
     if args.unused then
       let paths ← Project.files args.paths
-      return ← runBatch paths args (← unusedAnalyzer (← IO.currentDir) paths) (atomic := true)
+      return ← runBatch paths args (← unusedAnalyzer (← IO.currentDir) paths args.roots) (atomic := true)
         fun p t => discard <| lakeCheck p t
     if args.dedup || args.tactics || args.layout || args.propose.isSome then
       let paths ← Project.files args.paths

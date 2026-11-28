@@ -9,7 +9,7 @@ The default scan reads Lean files. The parser loads its own grammar and the pinn
 Install Elan with the toolchain in `lean-toolchain` (Lean 4.37.0-rc1) and run `lake build` in this repository. This builds `leanperf`, one native executable for the command line, the language server and the elaborated passes. Nothing else is required. From the project you want to lint, run the following commands, adjusting the checkout path as needed.
 
 ```sh
-# Shrink a directory's proofs with every checked pass, in order (see "Iterating")
+# Shrink a directory's proofs: cut, compress, optimize, every edit checked (see "The pipeline")
 ~/Code/lean-perf/.lake/build/bin/leanperf --golf src/
 
 # Preview a unified diff for a directory
@@ -41,10 +41,11 @@ Run `leanperf --list-lints` to see each lint's name, mode and purpose. Pick the 
 | Find likely restatements before building dependencies | `--dedup-pass syntax` | `syntacticDuplicate` |
 | Find restatements and more general theorems | `--dedup-pass elaborate` | `duplicate`, `specialCase` |
 | Reduce tactic search | `--tactics` | `fasterTactic`, `unneededOption`, `unneededSeal` |
-| Shrink everything, in the order below | `--golf` | every pass that follows, in turn |
+| Shrink everything: cut, compress, optimize | `--golf [--root T,…]` | every pass that follows, in turn |
+| Run the proof lints of some pipeline stages | `--stage cut,compress,optimize` | the lints of those stages |
 | Take tactic steps and declarations out of proofs with a checked rewrite | `--compress` | `reuseProof`, `reprove`, `unusedHave`, `redundantShow`, `unneededClassical`, `shorterBlock`, `unneededStep`, `contractPair`, `inlineHave`, `haveToRefine`, `obtainProjection`, `termExact`, `termCompile`, `simpaUsing`, `rwaAt`, `mergeRw`, `foldHelper` |
 | Also save bytes without changing the steps | `--compress --cosmetic` | adds `restatedType`, `redundantAscription`, `unneededErasure`, `shorterSimp`, `shortProjection`, `shortNames`, `sharedHaveBinders`, `shorterSignature`, `unusedInstance` |
-| Delete theorems nothing uses, before building dependencies | `--unused` | `unusedTheorem` |
+| Delete theorems nothing uses, or that the given theorems do not need, before building dependencies | `--unused [--root T,…]` | `unusedTheorem` |
 | Put continuation lines on the line they continue | `--layout` | `joinLines`, and `stripComments` when `--rules` names it |
 | Rewrite theorems with an external proposer, such as a language model | `--propose CMD` | `rewrite` |
 
@@ -206,9 +207,17 @@ On `LocalFields.lean` in the Riemann project, which is already golfed by thousan
 
 Most of what separates the readable and compact editions of the Riemann development is declarations: 57% of the readable edition's theorem lines are in lemmas used only in their own file. `foldHelper` folds a theorem that only one other declaration of its module uses, directly or through other such helpers, and that no other module mentions, into that declaration. Each helper becomes a `have` at the start of the theorem's proof, with its binders, statement and proof copied and re-indented, and its uses name the `have`, including uses by dot notation such as `h.helper x`, which become `nm x h` with `h` at the helper's receiver argument. Implicit and instance binders that the theorem already binds the same way are dropped, so the `have` uses the theorem's variables, and `Type*` becomes `Type _`, since a `have` cannot be universe polymorphic. Lean then elaborates every command from the first helper to the theorem: the theorems that stay must keep their statements and docstrings, nothing new may be declared, and the span may take at most twice its heartbeats. When a group fails, each helper is tried alone. A docstring that mentions a folded helper keeps the mention.
 
-### Iterating
+### The pipeline: cut, compress, optimize
 
-`leanperf --golf MODULE_OR_DIR…` (or `scripts/golf`) runs every pass that shrinks proofs, in the order that lets each feed the next. `--unused` deletes the theorems that nothing in the project mentions, so that no later pass works on them, and more helpers are left with one user to fold into. `--dedup` then proves each theorem that restates another by citing it. Rounds of `--unused` and `--compress` follow until a round changes nothing, and `--tactics` makes the remaining steps cheaper last. Every edit is elaborated before it is written. Run it from the project's root, on a clean working tree, and review the diff. `--cosmetic` adds the byte-only lints and `--layout` to each round, and `--strip-comments` first deletes the comments inside declarations. `--keep-unused` keeps the theorems that nothing uses, as for a library whose users are elsewhere, and `--no-optimize` skips `--tactics`. That last pass takes only cheaper tactics that add no bytes, since spelling out what `simp` uses can make a module a seventh longer; `--speed` takes them all.
+`leanperf --golf MODULE_OR_DIR…` (or `scripts/golf`) shrinks proofs in three stages, each of which feeds the next. Every lint belongs to one (`leanperf --list-lints` shows which), and every edit is elaborated before it is written. Run it from the project's root, on a clean working tree, and review the diff.
+
+1. **Cut** deletes what nothing needs, so that no later pass works on it and more helpers are left with one user to fold into. `--unused` deletes the theorems that nothing in the project mentions, and `--dedup` proves each theorem that restates another by citing it.
+2. **Compress** rewrites proofs in fewer steps and declarations: contractions, closers, folds, inlining. Each rewrite can make a step or a theorem unneeded, so compress runs in rounds with the cuts inside proofs, such as unused `have`s and unneeded steps, and with `--unused`, until a round changes nothing.
+3. **Optimize** makes the remaining steps cheaper to elaborate. It takes only cheaper tactics that add no bytes, since spelling out what `simp` uses can make a module a seventh longer; `--speed` takes them all, and `--no-optimize` none.
+
+`--stage cut,compress,optimize` runs the proof lints of the stages it names in one elaborated pass, which is what each round of `--golf` does. `--cosmetic` adds the byte-only lints and `--layout` to each round, and `--strip-comments` first deletes the comments inside declarations. `--keep-unused` keeps the theorems that nothing uses, as for a library whose users are elsewhere.
+
+`--root T,…` says which theorems the project is for. Cut then deletes every theorem that they do not need, directly or through other theorems, including the results of modules that nothing imports, which `--unused` alone keeps. Definitions, instances and other commands stay, since a tactic can use an instance or a `simp` set without naming it. A root names a theorem by its full name or a suffix of it, and one that names nothing stops the pass.
 
 The numbers below were measured before compression counted steps, when it counted bytes and ran the byte-only lints, with comments stripped. On `LocalFields.lean` it took 42,671 bytes to 29,648 (−30.5%), against 26,250 for the pipeline with Claude as proposer; most of the remaining difference is two helpers that Claude folds and Lean rejects as `have`s, and a theorem that Claude merges into the wrapper that restates it. On three other `ClassField` modules it did as well as one pass of Claude's on one of them, and less well on the other two:
 

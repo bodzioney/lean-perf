@@ -1124,6 +1124,28 @@ def unusedInstances : IO Unit := withFixture fun r => do
     check (has t s) s!"missing {s.quote}\n{t}"
   ok (← sh "lake" #["env", "lean", path.toString] r)
 
+/-- With `--root`, the theorems that matter are those the root needs: a result of a module that
+    nothing imports goes too, while definitions stay. -/
+def rootedTheorems : IO Unit := withFixture fun r => do
+  let lib := r / "Fixture" / "RootLib.lean"
+  let top := r / "Fixture" / "RootTop.lean"
+  IO.FS.writeFile lib ("def double (n : Nat) : Nat := n + n\n\n" ++
+    "theorem double_eq (n : Nat) : double n = n + n := rfl\n\n" ++
+    "theorem aside (n : Nat) : n + 0 = n := rfl\n")
+  IO.FS.writeFile top ("import Fixture.RootLib\n\n" ++
+    "theorem main (n : Nat) : double n = n + n := double_eq n\n\n" ++
+    "theorem other (n : Nat) : n = n := rfl\n")
+  -- `--check` elaborates each rewritten file against its built imports.
+  ok (← sh "lake" #["build"] r)
+  let none ← run #["--unused", "--root", "nowhere", "--apply", lib.toString, top.toString] r
+  check (none.code != 0) none.err; hasErr none "names no theorem"
+  let o ← run #["--unused", "--root", "main", "--check", "--apply", lib.toString, top.toString] r
+  ok o; hasErr o "2 edits"
+  let (l, t) := (← IO.FS.readFile lib, ← IO.FS.readFile top)
+  check (has l "def double" && has l "theorem double_eq" && !has l "aside") l
+  check (has t "theorem main" && !has t "theorem other") t
+  ok (← sh "lake" #["build"] r)
+
 def unusedTheorems : IO Unit := withFixture fun r => do
   let dead := r / "Fixture" / "Dead.lean"
   let other := r / "Fixture" / "DeadOther.lean"
@@ -1251,7 +1273,7 @@ def tests : List (String × IO Unit) := [
   ("local relation chains", relationChains), ("prune unused local proofs", pruneHaves),
   ("search for an alternative proof", alternativeProof),
   ("redundant proof steps", redundantSteps), ("simp erasures", simpErasures), ("shorter blocks", shorterBlocks), ("shorter simp", shorterSimp), ("unneeded steps", unneededSteps), ("redundant ascriptions", redundantAscriptions), ("joined lines", joinedLines), ("stripped comments", strippedComments), ("golf rules", golfRules), ("golf obtain projection", golfObtainProjection), ("golf term compile", golfTermCompile), ("golf tactic pairs", golfTacticPairs), ("folded helpers", foldedHelpers), ("wrapped suggestions", wrappedSuggestions), ("contracted pairs", contractedPairs), ("shortened names", shortenedNames), ("proposed rewrites", proposedRewrites), ("proposed groups", proposedGroups), ("lemma declarations", lemmaDeclarations),
-  ("unused theorems", unusedTheorems), ("unused theorems by namespace", unusedNamespaces), ("unused instance arguments", unusedInstances),
+  ("unused theorems", unusedTheorems), ("unused theorems for a root", rootedTheorems), ("unused theorems by namespace", unusedNamespaces), ("unused instance arguments", unusedInstances),
   ("type matching with dependent and unused arguments", matchingTypes), ("select named lints", lintSelection),
   ("permuted dependent statements", permutedStatements)]
 

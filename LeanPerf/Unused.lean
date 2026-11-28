@@ -248,8 +248,16 @@ structure Finding where
   range : Lsp.Range
   deriving Inhabited
 
-/-- Unused theorems of the `targets`, among all project `files`. -/
-def analyze (files : Array File) (targets : Std.HashSet String) : Std.HashMap String (Array (Nat × Command)) := Id.run do
+/-- Whether the declaration named `full` is `root`: by its full name or a suffix of its components. -/
+def names (full root : String) : Bool := full == root || full.endsWith ("." ++ root)
+
+/-- Unused theorems of the `targets`, among all project `files`. With `roots`, the theorems that
+    count as used are those that the named theorems use, directly or through others, rather than
+    every theorem of a module that no other module imports; text between declarations, such as
+    module documentation, then uses nothing. Commands that are not theorems stay roots either way:
+    a tactic can use an instance or a `simp` set without naming it. -/
+def analyze (files : Array File) (targets : Std.HashSet String) (roots : Array String := #[]) :
+    Std.HashMap String (Array (Nat × Command)) := Id.run do
   let imported := files.foldl (init := ({} : Std.HashSet String)) fun acc f => acc.insertMany f.imports
   -- Theorems by last name component.
   let mut byName : Std.HashMap String (Array (Nat × Nat)) := {}
@@ -281,7 +289,8 @@ def analyze (files : Array File) (targets : Std.HashSet String) : Std.HashMap St
   let refs (fi ci : Nat) : Array (Nat × Nat) :=
     let c := files[fi]!.commands[ci]!
     c.idents.foldl (fun acc t => acc ++ resolve c.bases t) #[]
-  let isRoot (f : File) (c : Command) := c.«theorem».isNone || !imported.contains f.module
+  let isRoot (f : File) (c : Command) := c.«theorem».isNone ||
+    (if roots.isEmpty then !imported.contains f.module else roots.any (names c.full))
   let mut seen : Std.HashSet (Nat × Nat) := {}
   let mut stack := #[]
   for h : fi in [:files.size] do
@@ -289,7 +298,7 @@ def analyze (files : Array File) (targets : Std.HashSet String) : Std.HashMap St
       if isRoot files[fi] files[fi].commands[ci] then
         seen := seen.insert (fi, ci)
         stack := stack.push (fi, ci)
-  let mut frontier : Array (Nat × Nat) :=
+  let mut frontier : Array (Nat × Nat) := if !roots.isEmpty then #[] else
     files.foldl (init := #[]) fun acc f => f.free.foldl (fun acc t => acc ++ resolve #[""] t) acc
   repeat
     for x in frontier do
