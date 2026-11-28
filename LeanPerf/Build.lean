@@ -208,7 +208,27 @@ def submit (slot : Slot) (key : UInt64) (dir : FilePath) (query : Bool) : IO Uni
   slot.set (some (key, child))
   child.stdin.putStrLn (Json.mkObj [("dir", toJson dir), ("query", toJson query)]).compress
   child.stdin.flush
-  let line ← child.stdout.getLine
+  -- A worker that runs past the limit is stopped, and its module fails: a tactic can loop where
+  -- no heartbeat is counted, and one module must not hold up the rest.
+  let limit := ((← IO.getEnv "LEANPERF_TIMEOUT").bind String.toNat?).getD 1800
+  let reading ← IO.asTask child.stdout.getLine .dedicated
+  let line ← if limit == 0 then IO.ofExcept reading.get else do
+    let timer ← IO.asTask (prio := .dedicated) do
+      let mut waited := 0
+      while waited < limit * 1000 do
+        if ← IO.checkCanceled then return ""
+        IO.sleep 250
+        waited := waited + 250
+      return "\x00"
+    let first ← IO.waitAny [reading, timer]
+    IO.cancel timer
+    match first with
+    | .ok "\x00" =>
+      child.kill
+      let _ ← slot.swap none
+      let _ ← child.wait
+      throw <| IO.userError s!"Lean worker took more than {limit} s for {dir} (LEANPERF_TIMEOUT)"
+    | r => IO.ofExcept r
   if line.isEmpty then
     stop slot
     throw <| IO.userError s!"Lean worker exited without a result for {dir}"
