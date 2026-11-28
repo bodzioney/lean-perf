@@ -45,6 +45,8 @@ structure Finding where
 structure Analysis where
   findings : Array Finding := #[]
   skipped : Nat := 0
+  /-- The tactic steps and declarations of the file as it was read, when the pass counted them. -/
+  steps : Option (Nat × Nat) := none
 
 /-- A pass: analyze a file (optionally unsaved text), check a candidate text, and shut down. -/
 structure Analyzer where
@@ -194,7 +196,10 @@ def elaboratedAnalyzer (root : FilePath) (paths : Array FilePath) (general := tr
       if tacticSaving.isSome && (← IO.ofExcept (r.getObjValAs? Nat "elabErrors")) > 0 then
         throw <| IO.userError "tactic analysis could not elaborate the original module"
       let findings ← IO.ofExcept (r.getObjValAs? (Array Finding) "findings")
-      return { findings, skipped := (r.getObjValAs? Nat "skippedCommands").toOption.getD 0 }
+      let steps := match r.getObjValAs? Nat "steps", r.getObjValAs? Nat "decls" with
+        | .ok s, .ok d => some (s, d)
+        | _, _ => none
+      return { findings, skipped := (r.getObjValAs? Nat "skippedCommands").toOption.getD 0, steps }
     check := fun path text => do
       let r ← request [("path", toJson path.toString), ("text", toJson text), ("check", true)]
       IO.ofExcept (r.getObjValAs? (Array String) "errors")
@@ -588,6 +593,7 @@ def runBatch (paths : Array FilePath) (args : Args) (an : Analyzer)
   let mut failed := 0
   let mut count := 0
   let mut skipped := 0
+  let mut counted : Option (Nat × Nat) := none
   let mut pending := #[]
   for path in paths do
     let lbl ← label path
@@ -597,6 +603,9 @@ def runBatch (paths : Array FilePath) (args : Args) (an : Analyzer)
       let r ← an.analyze path (some text)
       let r := { r with findings := r.findings.filter (args.rules.contains ·.rule) }
       skipped := skipped + r.skipped
+      if let some (s, d) := r.steps then
+        let (s0, d0) := counted.getD (0, 0)
+        counted := some (s0 + s, d0 + d)
       for f in r.findings do
         if let (some msg, some rg) := (f.message, f.range) then
           IO.eprintln s!"{lbl}:{rg.start.line + 1}:{rg.start.character + 1}: {f.rule}: {msg}"
@@ -625,6 +634,7 @@ def runBatch (paths : Array FilePath) (args : Args) (an : Analyzer)
       for (path, original, new) in pending do
         try save path original new
         catch e => IO.eprintln s!"{← label path}: {e}"; failed := failed + 1
+  if let some (s, d) := counted then IO.eprintln s!"counted: {s} tactic steps, {d} declarations before the edits"
   IO.eprintln s!"{count} edits, {skipped} unparsed commands, {failed} failed files"
   return if failed > 0 then 1 else 0
 
@@ -942,7 +952,21 @@ def golf (argv : List String) : IO UInt32 := do
     if o.exitCode != 0 then
       IO.eprintln s!"{" ".intercalate args.toList}: {(o.stderr.trimAscii.toString.splitOn "\n").getLastD ""}"
     return (n, o.exitCode != 0)
-  IO.println s!"start: {← size} bytes"
+  -- Steps and declarations, from a pass that only parses.
+  let counts : IO (Option (Nat × Nat)) := do
+    let o ← IO.Process.output { cmd := (← IO.appPath).toString,
+                                args := #["--layout", "--rules", "joinLines"] ++ extra ++ paths }
+    let some l := (o.stderr.splitOn "\n").find? (·.startsWith "counted: ") | return none
+    match (l.drop 9).toString.splitOn " " with
+    | s :: _ :: _ :: d :: _ => return (s.toNat?.bind fun s => (d.toNat?.map (s, ·)))
+    | _ => return none
+  let describe (c : Option (Nat × Nat)) (bytes : Nat) : String :=
+    match c with
+    | some (s, d) => s!"{s} tactic steps, {d} declarations, {bytes} bytes"
+    | none => s!"{bytes} bytes"
+  let before ← counts
+  let bytes0 ← size
+  IO.println s!"start: {describe before bytes0}"
   if strip then
     let (n, f) ← pass #["--layout", "--rules", "stripComments,joinLines", "--apply", "--check"]
     failed := failed || f
@@ -967,6 +991,7 @@ def golf (argv : List String) : IO UInt32 := do
     let (n, f) ← pass #["--tactics", "--apply", "--check"]
     failed := failed || f
     IO.println s!"cheaper tactics: {n} edits, {← size} bytes"
+  IO.println s!"end: {describe (← counts) (← size)} (from {describe before bytes0})"
   return if failed then 1 else 0
 
 unsafe def run (argv : List String) : IO UInt32 := do

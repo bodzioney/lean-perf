@@ -365,6 +365,9 @@ def fewerSteps (input : String) (map : FileMap) (cmd : Syntax) (pctx : Parser.Pa
 structure Result where
   edits : Array Edit := #[]
   errors : Array String := #[]
+  /-- The tactic steps (`Steps.count`) and declarations of the module as it was read. -/
+  steps : Nat := 0
+  decls : Nat := 0
   deriving Inhabited
 
 /-- Elaborate `input` on top of `env` (its imports), collecting edits. -/
@@ -397,6 +400,8 @@ def analyze (env : Environment) (main : Name) (fileName input : String) (opts : 
     let pos := ps.pos
     ps := ps'
     if Parser.isTerminalCommand cmd then break
+    res := { res with steps := res.steps + Steps.count (Steps.tacticKinds pctx.env) cmd
+                      decls := res.decls + (if Steps.isDeclaration cmd then 1 else 0) }
     let ctx : Command.Context :=
       { fileName, fileMap := ictx.fileMap, cmdPos := pos, snap? := none, cancelTk? := none }
     if comments then

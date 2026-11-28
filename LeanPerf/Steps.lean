@@ -34,6 +34,11 @@ partial def count (kinds : Parser.SyntaxNodeKindSet) (stx : Syntax) : Nat :=
     args.foldl (fun n a => n + count kinds a) own
   | _ => 0
 
+/-- Whether `cmd` declares something: `theorem`, `def`, `instance`, `structure`, Mathlib's `lemma`… -/
+partial def isDeclaration (cmd : Syntax) : Bool :=
+  cmd.isOfKind ``Parser.Command.declaration || cmd.getKind == `lemma ||
+    (cmd.getKind == ``Parser.Command.in && isDeclaration cmd[2])
+
 /-- The steps of the command that `text` holds, parsed alone; none when it does not parse. -/
 def ofCommand (kinds : Parser.SyntaxNodeKindSet) (text : String) (pctx : Parser.ParserModuleContext)
     (fileName : String) : Option Nat :=

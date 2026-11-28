@@ -647,6 +647,8 @@ structure Report where
   findings : Array Finding := #[]
   skippedCommands : Nat := 0
   elabErrors : Nat := 0
+  steps : Option Nat := none
+  decls : Option Nat := none
   deriving ToJson, FromJson
 
 def message (decl : Name) (m : Match) (visible : Bool) : String :=
@@ -817,7 +819,7 @@ private def worker (context : IO.Ref (Option Context)) (dir : FilePath) (query :
       { rule := e.rule, message := e.message, lemma := "", range := e.range
         edit := some { range := e.range, newText := e.newText } : Finding }
     IO.FS.writeFile (dir / "result.json")
-      (toJson ({ findings, elabErrors := r.errors.size } : Report)).compress
+      (toJson ({ findings, elabErrors := r.errors.size, steps := some r.steps, decls := some r.decls } : Report)).compress
     for e in r.errors do IO.eprintln s!"{job.source}: {e}"
     return
   let (env, res) ← elabSource base job.mod job.source.toString input opts (full := checking)
