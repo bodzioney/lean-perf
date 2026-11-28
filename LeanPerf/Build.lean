@@ -121,6 +121,25 @@ def plan (root cache : FilePath) (paths : Array FilePath) (options : Array Strin
     stack := stack.push (m, true) ++ (imports.reverse.map (·, false))
   let sp ← searchPathRef.get
   let syslib ← getLibDir (← findSysroot)
+  -- A checkout rewrites a source without changing it, which makes its `.olean` look older. Lake
+  -- compares content hashes, so it decides for the modules whose `.olean` is older than the source.
+  let lake := (← findSysroot) / "bin" / "lake"
+  let mut stale := #[]
+  for m in order do
+    if let some p ← sp.findModuleWithExt "olean" m then
+      if (← p.metadata).modified < (← sources[m]!.path.metadata).modified then stale := stale.push m
+  let upToDate (ms : Array Name) : IO Bool := do
+    let out ← IO.Process.output { cmd := lake.toString, args := #["build", "--no-build"] ++ ms.map (s!"+{·}") }
+    return out.exitCode == 0
+  let mut current : Std.HashSet Name := {}
+  -- Usually all of them are current, which one call settles.
+  if !stale.isEmpty && (← upToDate stale) then
+    current := Std.HashSet.ofArray stale
+    stale := #[]
+  for batch in (List.range ((stale.size + 7) / 8)).map (fun i => stale.extract (8 * i) (8 * i + 8)) do
+    let tasks ← batch.mapM fun m => IO.asTask (upToDate #[m])
+    for (m, t) in batch.zip tasks do
+      if (← IO.ofExcept t.get) then current := current.insert m
   let mut seed := hash (root.toString, options, Lean.githash, sp.map (·.toString),
     (← IO.getEnv "LEANPERF_FULL").isSome, ← stamp (← IO.appPath))
   for file in ["lake-manifest.json", "lakefile.toml", "lakefile.lean", "lean-toolchain"] do
@@ -130,16 +149,27 @@ def plan (root cache : FilePath) (paths : Array FilePath) (options : Array Strin
   let mut jobs : Std.HashMap Name Job := {}
   let mut keys : Std.HashMap Name UInt64 := {}
   let mut needed : Std.HashSet Name := {}
+  -- Targets analyzed from source whose current `.olean` other modules import.
+  let mut builtTargets : Std.HashSet Name := {}
   for m in order do
     let src := sources[m]!
-    let deps := src.imports.filterMap fun i => jobs[i]?.map (·.toArtifact)
+    let deps := src.imports.filterMap fun i =>
+      if builtTargets.contains i then none else jobs[i]?.map (·.toArtifact)
     if dependenciesOnly then
       for dep in deps do needed := needed.insert dep.mod
     let built ← sp.findModuleWithExt "olean" m
-    if !requested.contains m && deps.isEmpty then
+    if deps.isEmpty then
       if let some p := built then
-        if (← p.metadata).modified >= (← src.path.metadata).modified then
+        if current.contains m || (← p.metadata).modified >= (← src.path.metadata).modified then
           keys := keys.insert m (← objectKey sp syslib memo m)
+          unless requested.contains m do continue
+          -- The edits LeanPerf checks keep every exported type, so a module that imports this
+          -- target sees the same declarations in its `.olean` as in a skeleton of the source.
+          builtTargets := builtTargets.insert m
+          jobs := jobs.insert m {
+            mod := m, dir := cache / "objects" / toString (mixHash seed (hash (m, src.digest, keys[m]!)))
+            source := src.path, sourceHash := src.digest, headerKey := src.headerKey, deps, options,
+            requested := !dependenciesOnly }
           continue
     let mut key := mixHash seed (hash (m, src.digest))
     for i in src.imports do

@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""Candidates for `contractPair` from a table of proposals made beforehand, for instance by a large
+model answering many pairs in one request (see scripts/ml/pairdump.py).
+
+It reads {"steps": [...]} (or "first" and "second") on standard input and writes {"candidates": [...]}:
+the proposals the table holds for exactly those steps.
+
+Environment:
+  LEANPERF_PAIR_TABLE   a JSON-lines file of {"steps": [...], "candidates": [...]}
+"""
+import json
+import os
+import sys
+
+
+def main():
+    req = json.load(sys.stdin)
+    steps = req.get("steps") or [req.get("first", ""), req.get("second", "")]
+    out = []
+    path = os.environ.get("LEANPERF_PAIR_TABLE")
+    if path and os.path.exists(path):
+        for line in open(path):
+            e = json.loads(line)
+            if e.get("steps") == steps:
+                out += [c for c in e.get("candidates", []) if c not in out]
+    json.dump({"candidates": out}, sys.stdout)
+
+
+if __name__ == "__main__":
+    main()

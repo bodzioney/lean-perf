@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""A proposer for `leanperf --propose` backed by OpenAI's Codex command line (`codex exec`), with the
+prompt of scripts/propose-claude. Codex runs read-only, in a scratch directory, and only answers.
+
+It reads a LeanPerf request on standard input and writes {"candidates": [...]} on standard output.
+LeanPerf checks every candidate with Lean.
+
+Environment:
+  LEANPERF_PROPOSE_CODEX        the command to run (default: codex)
+  LEANPERF_PROPOSE_CODEX_MODEL  a model for `codex exec -m` (default: Codex's configured one)
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+here = os.path.dirname(os.path.abspath(__file__))
+loader = importlib.machinery.SourceFileLoader("propose_claude", os.path.join(here, "propose-claude"))
+spec = importlib.util.spec_from_loader("propose_claude", loader)
+claude = importlib.util.module_from_spec(spec)
+loader.exec_module(claude)
+
+
+def main():
+    req = json.load(sys.stdin)
+    with tempfile.TemporaryDirectory() as d:
+        out = os.path.join(d, "answer.txt")
+        cmd = [os.environ.get("LEANPERF_PROPOSE_CODEX", "codex"), "exec", "-s", "read-only",
+               "--skip-git-repo-check", "--ephemeral", "-C", d, "-o", out, "-"]
+        if os.environ.get("LEANPERF_PROPOSE_CODEX_MODEL"):
+            cmd[2:2] = ["-m", os.environ["LEANPERF_PROPOSE_CODEX_MODEL"]]
+        prompt = claude.SYSTEM + "\n\n" + claude.prompt(req)
+        try:
+            subprocess.run(cmd, input=prompt, capture_output=True, text=True, timeout=900)
+            text = open(out).read() if os.path.exists(out) else ""
+        except (OSError, subprocess.SubprocessError):
+            text = ""
+    blocks = [b.strip() for b in re.findall(r"```(?:lean4?|)\n(.*?)```", text, re.S)]
+    json.dump({"candidates": [b for b in blocks if b]}, sys.stdout)
+
+
+if __name__ == "__main__":
+    main()

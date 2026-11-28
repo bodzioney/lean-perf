@@ -1,4 +1,5 @@
 import LeanPerf.Relations
+import LeanPerf.Replay
 
 open Lean Elab Meta
 
@@ -8,8 +9,9 @@ namespace LeanPerf.ProofCompression
 Elaborate `term` as a proof of `concl`. Called in the context of the proof's binders, under
 their own names, as when the proof is elaborated in its source file.
 -/
-def confirm (concl : Expr) (term : String) : MetaM Bool := do
+def confirm (concl : Expr) (term : String) (site : Option Syntax.Range := none) : MetaM Bool := do
   let .ok stx := Parser.runParserCategory (← getEnv) `term term | return false
+  let stx := site.elim stx (Replay.relocate · stx)
   let check : TermElabM Bool := do
     let e ← Term.elabTermEnsuringType stx concl
     Term.synthesizeSyntheticMVarsNoPostponing
@@ -69,13 +71,13 @@ private def applyTheorem (p : Expr) (n : Name) : MetaM (Option Expr) := observin
   guard (!proof.hasMVar && !proof.hasSorry)
   return proof
 
-private def suggestion (goal : Expr) (originalProof : Option Expr) (original : String) (imports locals : Index) (atomic : Bool) :
-    MetaM (Option String) := do
+private def suggestion (goal : Expr) (originalProof : Option Expr) (original : String) (imports locals : Index) (atomic : Bool)
+    (site : Syntax.Range) : MetaM (Option String) := do
   let mut best := none
   let mut bound := original.utf8ByteSize
   for p in ← Relations.candidates goal do
     let p := if atomic && p.contains ' ' then "(" ++ p ++ ")" else p
-    if p.utf8ByteSize < bound && (← confirm goal p) then
+    if p.utf8ByteSize < bound && (← confirm goal p site) then
       best := some p
       bound := p.utf8ByteSize
   let mut orientations := #[(goal, none)]
@@ -94,11 +96,12 @@ private def suggestion (goal : Expr) (originalProof : Option Expr) (original : S
         if Linter.isDeprecated (← getEnv) n then continue
         if let some proof ← applyTheorem p n then proofs := proofs.push proof
     for proof in proofs do
+      if proof.getUsedConstants.any Replay.generated then continue
       let e ← if let some n := symm then mkAppM n #[proof] else pure proof
       let text := (← withOptions (fun o => o.setBool `pp.proofs true) (Meta.ppExpr e)).pretty 200
       if text.contains '\n' then continue
       let text := if atomic && text.contains ' ' then "(" ++ text ++ ")" else text
-      if text.utf8ByteSize < bound && (← confirm goal text) then
+      if text.utf8ByteSize < bound && (← confirm goal text site) then
         best := some text
         bound := text.utf8ByteSize
   return best
@@ -123,7 +126,7 @@ def scan (input : String) (map : FileMap) (tree : InfoTree) (imports locals : In
     let original := String.Pos.Raw.extract input r.start r.stop
     unless original.startsWith "by" && !original.contains "--" && !original.contains "/-" do continue
     let some decl := ti.mctxBefore.findDecl? g | continue
-    let replacement ← ci.runMetaM decl.lctx do
+    let replacement ← Replay.inFile map ci decl.lctx do
       tryCatchRuntimeEx (withCurrHeartbeats <| withTheReader Core.Context
         ({ · with maxHeartbeats := 3000000 }) do
           setMCtx ti.mctxAfter
@@ -133,7 +136,7 @@ def scan (input : String) (map : FileMap) (tree : InfoTree) (imports locals : In
           g.withContext do
             let goal ← instantiateMVars (← g.getType)
             if goal.hasMVar || !(← isProp goal) then return none
-            return ← suggestion goal small original imports locals (needsParens input r.start))
+            return ← suggestion goal small original imports locals (needsParens input r.start) r)
         fun _ => return none
     if let some text := replacement then
       edits := edits.push { range := map.utf8RangeToLspRange r, newText := text }

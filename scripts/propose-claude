@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""A proposer for `leanperf --propose`: asks Claude, through the `claude` command line, for shorter
+versions of one Lean declaration.
+
+It reads a LeanPerf request on standard input and writes {"candidates": [...]} on standard output.
+Nothing it returns is trusted: LeanPerf elaborates every candidate and keeps one only when it
+declares the same constants with the same statements and no new axioms.
+
+Environment:
+  LEANPERF_PROPOSE_MODEL  model alias or id passed to `claude --model` (default: sonnet)
+  LEANPERF_PROPOSE_CLAUDE the command to run (default: claude)
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+
+SYSTEM = ("You shorten Lean 4 proofs that use Mathlib. Answer only with Lean code blocks, "
+          "each holding one complete declaration.")
+
+RULES = """Rewrite the Lean 4 declaration below so that its source text is as short as possible while
+Lean still accepts it.
+
+Rules:
+- Keep the name, the binders (with their names) and the statement exactly as they are. Change only
+  the proof.
+- Do not use `sorry`, `admit`, `native_decide`, `set_option` or new axioms.
+- Any Mathlib lemma or tactic is fine: `simp`, `simp_all`, `grind`, `aesop`, `omega`, `linarith`,
+  `nlinarith`, `positivity`, `bound`, `fun_prop`, `gcongr`, `field_simp`, `ring`, `norm_num`,
+  term-mode proofs, `<;>`, anonymous constructors, `.1`/`.2`, `fun x ↦`, `·`.
+- Comments inside the proof may go. Fit lines within 100 columns.
+- Give up to 3 different candidates, shortest first, each the complete declaration in its own
+  ```lean block. Prefer proofs that are likely to compile over ones that are merely short."""
+
+
+GROUP = """The text holds several declarations. Keep the statements of {keep} exactly as they are,
+with their docstrings. The lemmas {free} are used only here: delete them, fold their proofs into
+the others, or keep them, whichever is shortest. Declare no names besides the original ones. Each
+candidate is the complete replacement text for all of these declarations."""
+
+
+def prompt(req):
+    parts = [RULES]
+    if req.get("free"):
+        parts += ["", GROUP.format(keep=", ".join(f"`{n}`" for n in req.get("keep", [])),
+                                   free=", ".join(f"`{n}`" for n in req["free"]))]
+    parts += ["", "The file above the declaration (imports, opens, variables, earlier lemmas):",
+              "```lean", req.get("context", ""), "```"]
+    if req.get("premises"):
+        parts += ["", "Theorems the current proof uses: " + ", ".join(req["premises"])]
+    parts += ["", "The declaration:", "```lean", req["declaration"], "```"]
+    failures = req.get("failures") or []
+    if failures:
+        parts += ["", "Lean rejected your previous candidates:"]
+        for f in failures:
+            parts += ["```lean", f["candidate"], "```", "Errors:"] + ["  " + e for e in f["errors"][:6]]
+        parts += ["", "Fix them, or find other short proofs."]
+    return "\n".join(parts)
+
+
+def main():
+    req = json.load(sys.stdin)
+    cmd = [os.environ.get("LEANPERF_PROPOSE_CLAUDE", "claude"), "-p",
+           "--model", os.environ.get("LEANPERF_PROPOSE_MODEL", "sonnet"),
+           "--tools", "", "--strict-mcp-config", "--no-session-persistence",
+           "--system-prompt", SYSTEM]
+    try:
+        out = subprocess.run(cmd, input=prompt(req), capture_output=True, text=True, timeout=600).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    blocks = [b.strip() for b in re.findall(r"```(?:lean4?|)\n(.*?)```", out, re.S)]
+    json.dump({"candidates": [b for b in blocks if b]}, sys.stdout)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Candidates for `contractPair` from a dictionary of contraction templates (scripts/ml/templates.py),
+best supported first, and optionally from another proposer after them.
+
+It reads {"steps": [...]} (or "first" and "second") on standard input and writes {"candidates": [...]}.
+
+With nothing set, it uses the dictionary that comes with LeanPerf (data/contractions.jsonl), and the
+model of scripts/pair-local after it when a server answers at LEANPERF_PAIR_URL.
+
+Environment:
+  LEANPERF_PAIR_DICT     the templates, a JSON-lines file written by templates.py
+  LEANPERF_PAIR_DICT_N   how many candidates to give at most (default: 8)
+  LEANPERF_PAIR_DICT_MIN the support a template needs when it writes a name the steps do not show,
+                         such as a lemma it learned from one example (default: 2)
+  LEANPERF_PAIR_NEXT     another proposer command whose candidates follow; empty for none
+"""
+import json
+import os
+import socket
+import subprocess
+import sys
+import urllib.parse
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "ml"))
+import pairprompt  # noqa: E402
+import templates  # noqa: E402
+
+
+def load(path):
+    out = []
+    for line in open(path):
+        e = json.loads(line)
+        pats = tuple(tuple(tuple(it) for it in p) for p in e["patterns"])
+        merged = tuple(tuple(it) for it in e["merged"])
+        out.append(((pats, merged), e["support"]))
+    return out
+
+
+def novel(template, steps):
+    """Whether the template writes an identifier that is not a tactic or keyword and that `steps` do not show."""
+    shown = {t for s in steps for t, _, _ in templates.tokens(s)}
+    return any(it[0] == "l" and (it[1][0].isalpha() or it[1][0] == "_") and not templates.literal(it[1])
+               and it[1] not in shown for it in template[1])
+
+
+def serving(url):
+    """Whether something listens where the model would answer."""
+    u = urllib.parse.urlparse(url)
+    try:
+        with socket.create_connection((u.hostname or "127.0.0.1", u.port or 80), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
+def main():
+    raw = sys.stdin.read()
+    req = json.loads(raw)
+    steps = req.get("steps") or [req.get("first", ""), req.get("second", "")]
+    limit = int(os.environ.get("LEANPERF_PAIR_DICT_N", "8"))
+    least = int(os.environ.get("LEANPERF_PAIR_DICT_MIN", "2"))
+    out = []
+    path = os.environ.get("LEANPERF_PAIR_DICT", os.path.join(HERE, "..", "data", "contractions.jsonl"))
+    if path and os.path.exists(path):
+        heads = [s.split()[0] if s.split() else "" for s in steps]
+        for t, support in load(path):
+            pats = t[0]
+            if len(pats) != len(steps) or any(p and p[0][0] == "l" and p[0][1] != h for p, h in zip(pats, heads)):
+                continue
+            if support < least and novel(t, steps):
+                continue
+            for c in templates.instances(t, steps):
+                if "\n" not in c and c not in out and not pairprompt.glued(steps, c):
+                    out.append(c)
+            if len(out) >= limit:
+                break
+    out = out[:limit]
+    nxt = os.environ.get("LEANPERF_PAIR_NEXT")
+    if nxt is None and serving(os.environ.get("LEANPERF_PAIR_URL", "http://127.0.0.1:8090/v1/chat/completions")):
+        nxt = "'" + os.path.join(HERE, "pair-local").replace("'", "'\\''") + "'"
+    if nxt:
+        try:
+            r = subprocess.run(["sh", "-c", nxt], input=raw, capture_output=True, text=True, timeout=600)
+            out += [c for c in json.loads(r.stdout).get("candidates", []) if c not in out]
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    json.dump({"candidates": out}, sys.stdout)
+
+
+if __name__ == "__main__":
+    main()

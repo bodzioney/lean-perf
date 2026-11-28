@@ -1,0 +1,45 @@
+import Lean
+
+/-!
+# Proof steps
+
+What `--compress` shortens: the tactic steps of a proof, the work a reader follows, rather than its
+bytes. A step is a node of the tactic category, wherever it is, including the tactic blocks inside
+terms. Nodes that only arrange other tactics are not steps: sequences, bullets, parentheses, `<;>`,
+`focus`, `case` and `next`. So `rw [a, b]` is one step, `constructor <;> simp` two, and
+`exact f (by simp)` two.
+-/
+
+open Lean
+
+namespace LeanPerf.Steps
+
+/-- Tactic syntax kinds that arrange other tactics rather than act on a goal. -/
+def structural : List SyntaxNodeKind :=
+  [``Parser.Tactic.tacticSeq, ``Parser.Tactic.tacticSeq1Indented, ``Parser.Tactic.tacticSeqBracketed,
+   ``Lean.cdot, ``Lean.Parser.Tactic.paren, ``Lean.Parser.Tactic.«tactic_<;>_», ``Lean.Parser.Tactic.focus,
+   ``Lean.Parser.Tactic.case, ``Lean.Parser.Tactic.«tacticNext_=>_»]
+
+/-- The syntax kinds of the tactic category in `env`. -/
+def tacticKinds (env : Environment) : Parser.SyntaxNodeKindSet :=
+  match (Parser.parserExtension.getState env).categories.find? `tactic with
+  | some c => c.kinds
+  | none => {}
+
+/-- The tactic steps in `stx`. -/
+partial def count (kinds : Parser.SyntaxNodeKindSet) (stx : Syntax) : Nat :=
+  match stx with
+  | .node _ k args =>
+    let own := if kinds.contains k && !structural.contains k then 1 else 0
+    args.foldl (fun n a => n + count kinds a) own
+  | _ => 0
+
+/-- The steps of the command that `text` holds, parsed alone; none when it does not parse. -/
+def ofCommand (kinds : Parser.SyntaxNodeKindSet) (text : String) (pctx : Parser.ParserModuleContext)
+    (fileName : String) : Option Nat :=
+  let ictx := Parser.mkInputContext text fileName
+  let (stx, ps, msgs) := Parser.parseCommand ictx pctx {} {}
+  let (eof, _, msgs) := Parser.parseCommand ictx pctx ps msgs
+  if msgs.hasErrors || !Parser.isTerminalCommand eof then none else some (count kinds stx)
+
+end LeanPerf.Steps

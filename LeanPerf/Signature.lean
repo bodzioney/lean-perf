@@ -1,4 +1,4 @@
-import Lean
+import LeanPerf.Replay
 
 open Lean Elab Meta
 
@@ -44,6 +44,17 @@ private def renderTypes (trees : PersistentArray InfoTree) (range : Syntax.Range
         unless texts.contains t do texts := texts.push t
   return texts
 
+/-- A theorem as a `Parser.Command.declaration`. Mathlib's `lemma` command,
+    `declModifiers group("lemma " declId declSig declVal)`, has the arguments of `theorem`. It
+    becomes the command that its macro produces, with every source position except the keyword's. -/
+def asTheorem? (cmd : Syntax) : Option Syntax := do
+  if cmd.isOfKind ``Parser.Command.declaration then
+    guard (cmd[1].isOfKind ``Parser.Command.theorem)
+    return cmd
+  guard ((cmd.getKind matches .str _ "lemma") && cmd[1].getNumArgs == 4)
+  let d := (cmd[1].modifyArg 0 (mkAtomFrom · "theorem" (canonical := true))).setKind ``Parser.Command.theorem
+  return (cmd.setArg 1 d).setKind ``Parser.Command.declaration
+
 /-- Resolve the newly declared public or private theorem in its original namespace. -/
 def theoremName? (d : Syntax) (before after : Command.State) : Option Name := do
   let id := d[1][0].getId
@@ -55,9 +66,8 @@ def theoremName? (d : Syntax) (before after : Command.State) : Option Name := do
     of the exported theorem type, including binder names, plicity and the order of universes. -/
 def compress (input : String) (map : FileMap) (cmd : Syntax) (ctx : Command.Context)
     (before after : Command.State) : IO (Option Lsp.TextEdit) := do
-  unless cmd.isOfKind ``Parser.Command.declaration do return none
+  let some cmd := asTheorem? cmd | return none
   let d := cmd[1]
-  unless d.isOfKind ``Parser.Command.theorem do return none
   let sig := d[2]
   let spec := sig[1]
   let ty := spec[1]
@@ -77,6 +87,7 @@ def compress (input : String) (map : FileMap) (cmd : Syntax) (ctx : Command.Cont
   for text in variants do
     if text.utf8ByteSize ≥ original.utf8ByteSize then continue
     let .ok parsed := Parser.runParserCategory before.env `term text | continue
+    let parsed := Replay.relocate r parsed
     let d' := d.setArg 2 (sig.setArg 1 (spec.setArg 1 parsed))
     let probe := { before with messages := {}, infoState := { enabled := false } }
     let .ok ((), checked) ← ((Command.elabCommandTopLevel (cmd.setArg 1 d')).run ctx |>.run probe).toIO' | continue

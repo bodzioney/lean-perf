@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""A proposer for `leanperf --propose` backed by a local model behind an OpenAI-compatible chat
+endpoint, such as `mlx_lm.server --model MODEL --adapter-path ADAPTERS`.
+
+It reads a LeanPerf request on standard input and writes {"candidates": [...]} on standard output,
+sampling a few rewrites of the declaration. LeanPerf checks each one with Lean.
+
+Environment:
+  LEANPERF_PROPOSE_URL      chat completions endpoint (default: http://127.0.0.1:8080/v1/chat/completions)
+  LEANPERF_PROPOSE_SAMPLES  how many rewrites to sample, all at once so the server can batch them (default: 8,
+                            half that for long prompts)
+  LEANPERF_PROPOSE_MAX_TOKENS  the longest answer to sample (default: 768)
+  LEANPERF_PROPOSE_PROOF_ONLY  0 for a model that writes whole declarations (default: 1, proofs only)
+  LEANPERF_PROPOSE_TRACE    a file to append each request's declaration and candidates to
+  LEANPERF_PROPOSE_CONTEXT  1 for a model trained with the related statements above the declaration
+                            (default: 0; see scripts/ml/context.py)
+"""
+import json
+import os
+import re
+import sys
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ml"))
+import context  # noqa: E402
+
+# The instruction the model is fine-tuned with; see scripts/ml/build.py. With LEANPERF_PROPOSE_PROOF_ONLY=0
+# the model writes the whole declaration instead of the proof alone.
+PROOF_ONLY = os.environ.get("LEANPERF_PROPOSE_PROOF_ONLY", "1") == "1"
+SYSTEM = ("You shorten Lean 4 proofs. Write a proof of the declaration's statement that is as short as you can "
+          "make it. Answer with the proof alone, the text that follows `:=`.") if PROOF_ONLY else (
+          "You shorten Lean 4 proofs. Rewrite the declaration as briefly as you can, keeping its name, "
+          "binders and statement exactly. Answer with the declaration only.")
+LAST_DECL = re.compile(r"^(?:/--.*?-/\s*)?(?:@\[[^\n]*\]\s*)?(?:(?:private|protected) )*(?:theorem|lemma) ", re.M | re.S)
+
+
+def split_proof(t):
+    """The statement and the proof of a declaration, around the first `:=` outside brackets."""
+    depth = 0
+    for i, c in enumerate(t[:-1]):
+        if c in "([{⟨⦃":
+            depth += 1
+        elif c in ")]}⟩⦄":
+            depth -= 1
+        elif depth == 0 and t.startswith(":=", i):
+            return t[:i], t[i + 2:]
+    return None
+
+
+def attach(statement, proof, width=100):
+    """The declaration with `proof` after its statement: on the statement's last line when that fits in
+    `width` columns, else on a line of its own (a tactic proof after `:= by`)."""
+    statement = statement.rstrip()
+    first = proof.split("\n", 1)[0]
+    if len(statement.rsplit("\n", 1)[-1]) + 4 + len(first) <= width:
+        return statement + " := " + proof
+    if proof.startswith("by "):
+        return statement + " := by\n  " + proof[3:].lstrip()
+    if proof.startswith("by\n") or proof == "by":
+        return statement + " := " + proof
+    return statement + " :=\n  " + proof
+
+
+def complete(url, messages, temperature, max_tokens):
+    """The model's answer, or None when it ran out of tokens or the server failed."""
+    body = json.dumps({"messages": messages, "temperature": temperature, "max_tokens": max_tokens}).encode()
+    req = urllib.request.Request(url, body, {"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=600) as r:
+            choice = json.load(r)["choices"][0]
+    except (OSError, ValueError, KeyError, IndexError):
+        return None
+    # A truncated answer is unfinished, often a loop; it is never a proof.
+    return None if choice.get("finish_reason") == "length" else choice["message"]["content"]
+
+
+def clean(text):
+    # Drop a reasoning preamble and code fences if the model writes them.
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+    m = re.search(r"```(?:lean4?)?\n(.*?)```", text, re.S)
+    return (m.group(1) if m else text).strip()
+
+
+def main():
+    req = json.load(sys.stdin)
+    url = os.environ.get("LEANPERF_PROPOSE_URL", "http://127.0.0.1:8080/v1/chat/completions")
+    samples = int(os.environ.get("LEANPERF_PROPOSE_SAMPLES", "8"))
+    text = req["declaration"]
+    # In a group, only the last declaration is rewritten; its helpers stay as they are.
+    starts = [m.start() for m in LAST_DECL.finditer(text)]
+    head, last = (text[:starts[-1]], text[starts[-1]:]) if starts else ("", text)
+    parts = split_proof(last) if PROOF_ONLY else None
+    if PROOF_ONLY and not parts:
+        json.dump({"candidates": []}, sys.stdout)
+        return
+    # The statements above the declaration that it most likely needs, including the group's own helpers.
+    related = context.related(req.get("context", "") + head, last) \
+        if os.environ.get("LEANPERF_PROPOSE_CONTEXT", "0") == "1" else ""
+    messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": context.message(related, last)}]
+    # Only a shorter proof is worth checking. Lean averages three or four bytes a token and even dense notation
+    # takes more than 1.5, so an answer that needs more tokens than two thirds of the old proof's bytes would
+    # not be shorter: stopping there cuts off the loops a small model falls into.
+    size = len((parts[1] if PROOF_ONLY else last).encode())
+    # A small model does not write long proofs right, and many long answers at once fill a laptop GPU's memory
+    # (the server's batch holds every sample's keys and values): cap the answer, and sample long prompts less.
+    budget = min(int(os.environ.get("LEANPERF_PROPOSE_MAX_TOKENS", "768")), max(48, 2 * size // 3))
+    if len(messages[1]["content"].encode()) > 4000:
+        samples = max(1, samples // 2)
+    temps = [0.0] + [0.8] * (samples - 1)
+    with ThreadPoolExecutor(len(temps)) as pool:
+        answers = list(pool.map(lambda t: complete(url, messages, t, budget), temps))
+    out = []
+    for a in answers:
+        if a is None:
+            continue
+        c = clean(a)
+        if not c:
+            continue
+        # A model asked for the proof alone sometimes writes the whole declaration.
+        whole = not PROOF_ONLY or LAST_DECL.match(c)
+        c = head + (c if whole else attach(parts[0], c))
+        # Saving a byte or two only joins lines, which `--layout` does without a model.
+        if len(c.encode()) + 8 <= len(text.encode()) and c not in out:
+            out.append(c)
+    if os.environ.get("LEANPERF_PROPOSE_TRACE"):
+        with open(os.environ["LEANPERF_PROPOSE_TRACE"], "a") as f:
+            f.write(json.dumps({"declaration": text, "round": req.get("round"), "candidates": out}) + "\n")
+    json.dump({"candidates": out}, sys.stdout)
+
+
+if __name__ == "__main__":
+    main()

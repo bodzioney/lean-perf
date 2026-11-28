@@ -1,6 +1,8 @@
 import LeanPerf.Build
+import LeanPerf.Lints
 import LeanPerf.Project
 import LeanPerf.Tactics
+import LeanPerf.Unused
 
 /-!
 # Duplicate and specialized theorems
@@ -742,6 +744,22 @@ private structure Context where
   index : IO.Ref (Option ImportedIndex)
   proofIndex : IO.Ref (Option ProofCompression.Index)
 
+builtin_initialize citedRef : IO.Ref (Option (Std.HashSet String)) ← IO.mkRef none
+
+/-- The last name components of what some project module applies with `@`, read once. -/
+private def cited : IO (Std.HashSet String) := do
+  if let some c ← citedRef.get then return c
+  let (src, _) ← Project.settings
+  let mut out := {}
+  for p in ← Project.files #[src] do
+    out := out.insertMany (Unused.explicitlyApplied (← IO.FS.readFile p))
+  citedRef.set (some out)
+  return out
+
+private def lastComponent : Name → String
+  | .str _ s => s
+  | _ => ""
+
 private def worker (context : IO.Ref (Option Context)) (dir : FilePath) (query : Bool) : IO Unit := do
   let job : Build.Job ← Build.readJson (dir / "job.json")
   let req : Json ← if query then Build.readJson (dir / "request.json") else pure .null
@@ -775,10 +793,26 @@ private def worker (context : IO.Ref (Option Context)) (dir : FilePath) (query :
         pure (some idx)
       else pure none
     let r ← Tactics.analyze base job.mod job.source.toString input opts minSaving
-      (tactics := enabled "fasterTactic") (options := enabled "unneededOption")
+      (tactics := enabled "fasterTactic") (options := enabled "unneededOption") (seals := enabled "unneededSeal")
       (shorter := (req.getObjValAs? Bool "shorter").toOption.getD false)
       (compression := compression)
       (signatures := compress && enabled "shorterSignature") (prune := compress && enabled "unusedHave")
+      (searchProofs := compress && enabled "reprove")
+      (redundant := if compress then Lints.redundant.filter enabled else [])
+      (blocks := compress && enabled "shorterBlock") (steps := compress && enabled "unneededStep")
+      (simpArgs := compress && enabled "shorterSimp")
+      (pairs := compress && enabled "contractPair")
+      (layout := (req.getObjValAs? Bool "layout").toOption.getD false && enabled "joinLines")
+      (comments := (req.getObjValAs? Bool "layout").toOption.getD false && enabled "stripComments")
+      (golf := if compress then Golf.rules.filter enabled else [])
+      (fold := compress && enabled "foldHelper")
+      (proposer := ((req.getObjValAs? String "propose").toOption.filter (!·.isEmpty)).filter
+        fun _ => enabled "rewrite")
+      (external := (req.getObjValAs? (Array String) "external").toOption.getD #[])
+      (instances := ← if compress && enabled "unusedInstance" then do
+          let names ← cited
+          pure (some fun n => names.contains (lastComponent n))
+        else pure none)
     let findings := r.edits.map fun e =>
       { rule := e.rule, message := e.message, lemma := "", range := e.range
         edit := some { range := e.range, newText := e.newText } : Finding }
@@ -787,6 +821,12 @@ private def worker (context : IO.Ref (Option Context)) (dir : FilePath) (query :
     for e in r.errors do IO.eprintln s!"{job.source}: {e}"
     return
   let (env, res) ← elabSource base job.mod job.source.toString input opts (full := checking)
+  -- A skeleton can elaborate differently from its source: a definition that uses a section
+  -- variable only inside a proof stops taking it as an argument once the proof is `sorry`. Such
+  -- a module is elaborated with its proofs instead.
+  let (env, res) ← if !checking && !query && res.parseErrors == 0 && res.elabErrors > 0 then
+      elabSource base job.mod job.source.toString input opts (full := true)
+    else pure (env, res)
   if checking then
     IO.FS.writeFile (dir / "result.json") (Json.mkObj [
       ("errors", toJson res.messages), ("elabErrors", res.elabErrors)]).compress
@@ -905,7 +945,10 @@ private unsafe def answer (slot : Build.Slot) (w : Workspace) (m : Name) (req : 
   let minSaving := (req.getObjValAs? Nat "minSaving").toOption.getD 1000
   let shorter := (req.getObjValAs? Bool "shorter").toOption.getD false
   let compress := (req.getObjValAs? Bool "compress").toOption.getD false
-  let tacticReport := w.cache / "tactics" / s!"{job.dir.fileName.get!}-{minSaving}-{shorter}-{compress}.json"
+  let layout := (req.getObjValAs? Bool "layout").toOption.getD false
+  let propose := (req.getObjValAs? String "propose").toOption.getD ""
+  let tacticReport := w.cache / "tactics" /
+    s!"{job.dir.fileName.get!}-{minSaving}-{shorter}-{compress}{if layout then "-layout" else ""}{if propose.isEmpty then "" else s!"-propose{hash propose}"}.json"
   let cacheTactics := tactics && !checking && saved
   if cacheTactics && (← tacticReport.pathExists) then return ← Build.readJson tacticReport
   if saved && !raw && (← resultFile.pathExists) then
@@ -1004,7 +1047,9 @@ Run from the target Lake project. Reports checked proof terms and their location
   let buildOnly := rest.contains "--build-only"
   let compress := rest.contains "--compress"
   let shorter := compress || rest.contains "--shorter"
-  let tactics := compress || rest.contains "--tactics"
+  let layout := rest.contains "--layout"
+  let propose := rest.findSome? fun a => (a.dropPrefix? "--propose=").map (·.toString)
+  let tactics := compress || layout || propose.isSome || rest.contains "--tactics"
   let mut minSaving := 1000
   let cache : System.FilePath := (← IO.getEnv "LEANPERF_CACHE_DIR").map System.FilePath.mk
     |>.getD ((← IO.currentDir) / ".lake" / "leanperf")
@@ -1012,7 +1057,8 @@ Run from the target Lake project. Reports checked proof terms and their location
   let mut files : Array System.FilePath := #[]
   let mut workers := (← IO.getEnv "LEANPERF_JOBS").getD "2"
   for a in rest do
-    if ["--serve", "--batch-replay", "--build-only", "--shorter", "--tactics", "--compress"].contains a then continue
+    if ["--serve", "--batch-replay", "--build-only", "--shorter", "--tactics", "--compress", "--layout"].contains a then continue
+    if a.startsWith "--propose=" then continue
     if let some n := a.dropPrefix? "--min-saving=" then
       minSaving := (n.toString.toNat?.getD 1) * 1000
       continue
@@ -1034,7 +1080,7 @@ Run from the target Lake project. Reports checked proof terms and their location
   let mut world ← prepare root cache files options jobs tactics
   let slot ← IO.mkRef none
   let tacticConfig := Json.mkObj [("tactics", true), ("minSaving", minSaving),
-    ("shorter", shorter), ("compress", compress)]
+    ("shorter", shorter), ("compress", compress), ("layout", layout), ("propose", propose.getD "")]
   if batch && tactics then
     let mut failed := 0
     for path in files do

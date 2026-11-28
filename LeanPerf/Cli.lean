@@ -1,6 +1,7 @@
 import LeanPerf.Rules
 import LeanPerf.Lints
 import LeanPerf.SyntaxDedup
+import LeanPerf.Unused
 import LeanPerf.Project
 import Std.Sync.Channel
 import Std.Sync.Mutex
@@ -118,10 +119,28 @@ def syntaxAnalyzer (root : FilePath) (paths : Array FilePath) : IO Analyzer := d
         { rule := f.rule, message := some f.message, «lemma» := some f.«lemma», range := some f.range } }
     check := fun _ _ => throw <| IO.userError "the syntactic pass suggests no proofs to check" }
 
+/-- Unused theorems of `paths`, from the source text of every module under the project's `srcDir`. -/
+def unusedAnalyzer (root : FilePath) (paths : Array FilePath) : IO Analyzer := do
+  let src ← IO.FS.realPath (← srcDir root)
+  let all ← Project.files #[src]
+  let files ← all.mapM fun p => return Unused.parse p (SyntaxDedup.moduleName src p) (← IO.FS.readFile p)
+  let targets ← paths.mapM fun p => return (← IO.FS.realPath p).toString
+  let found := Unused.analyze files (Std.HashSet.ofArray targets)
+  return {
+    analyze := fun path text => do
+      let some text := text | return {}
+      let some cmds := found[(← IO.FS.realPath path).toString]? | return {}
+      let chars := text.toList.toArray
+      return { findings := cmds.map fun (_, c) =>
+        let range : Lsp.Range := ⟨SyntaxDedup.lspPos chars c.lead, SyntaxDedup.lspPos chars c.stop⟩
+        { rule := "unusedTheorem", message := some s!"{c.name} is not mentioned anywhere else in the project",
+          range := some range, edit := some { range, newText := "" } } }
+    check := fun _ _ => pure #[] }
+
 /-- This executable under `lake env` in the target project, answering one JSON request per line. -/
 def elaboratedAnalyzer (root : FilePath) (paths : Array FilePath) (general := true)
-    (jobs : Option Nat := none) (tacticSaving : Option Nat := none) (shorter compress := false)
-    (disabled : List String := []) : IO Analyzer := do
+    (jobs : Option Nat := none) (tacticSaving : Option Nat := none) (shorter compress layout := false)
+    (propose : Option String := none) (disabled : List String := []) : IO Analyzer := do
   if let some r ← toolchainMismatch root then
     throw <| IO.userError s!"cannot elaborate the project: {r}"
   let (h, listing) ← IO.FS.createTempFile
@@ -132,6 +151,8 @@ def elaboratedAnalyzer (root : FilePath) (paths : Array FilePath) (general := tr
     (tacticSaving.map (fun n => #["--tactics", "--batch-replay", s!"--min-saving={n}"])).getD #[] ++
     (if shorter then #["--shorter"] else #[]) ++
     (if compress then #["--compress"] else #[]) ++
+    (if layout then #["--layout"] else #[]) ++
+    (propose.map (#["--propose=" ++ ·])).getD #[] ++
     (jobs.map (#[s!"--jobs={·}"])).getD #[] ++ #[s!"--file-list={listing}"]
   let child ← IO.Process.spawn { cmd := (← IO.appPath).toString, args, cwd := root,
                                  stdin := .piped, stdout := .piped, stderr := .inherit }
@@ -148,9 +169,28 @@ def elaboratedAnalyzer (root : FilePath) (paths : Array FilePath) (general := tr
     if let .ok e := r.getObjValAs? String "error" then throw <| IO.userError e
     return r
   let textField (t : Option String) := (t.map fun t => [("text", toJson t)]).getD []
+  -- A proposer, or `foldHelper`, may fold away a theorem that no other module mentions.
+  let external ← if propose.isNone && !(compress && !disabled.contains "foldHelper") then pure (fun _ => pure []) else do
+    let src ← IO.FS.realPath (← srcDir root)
+    let all ← Project.files #[src]
+    let files ← all.mapM fun p => return Unused.parse p (SyntaxDedup.moduleName src p) (← IO.FS.readFile p)
+    let mentions (f : Unused.File) : Std.HashSet String :=
+      (f.commands.foldl (fun acc c => acc ++ c.idents) f.free).foldl
+        (fun acc t => acc.insertMany (Unused.components t)) {}
+    let sets := files.map mentions
+    let mut count : Std.HashMap String Nat := {}
+    for m in sets do
+      for c in m do count := count.insert c (count.getD c 0 + 1)
+    let byPath : Std.HashMap String Nat := Std.HashMap.ofList (files.toList.zipIdx.map fun (f, i) => (f.path.toString, i))
+    pure fun (path : FilePath) => do
+      let some i := byPath[(← IO.FS.realPath path).toString]? | return []
+      let own := sets[i]!
+      let names := files[i]!.commands.filterMap (·.«theorem»)
+      let outside := names.filter fun n => count.getD n 0 > (if own.contains n then 1 else 0)
+      return [("external", toJson outside)]
   return {
     analyze := fun path text => do
-      let r ← request ([("path", toJson path.toString)] ++ textField text)
+      let r ← request ([("path", toJson path.toString)] ++ textField text ++ (← external path))
       if tacticSaving.isSome && (← IO.ofExcept (r.getObjValAs? Nat "elabErrors")) > 0 then
         throw <| IO.userError "tactic analysis could not elaborate the original module"
       let findings ← IO.ofExcept (r.getObjValAs? (Array Finding) "findings")
@@ -405,16 +445,29 @@ structure Args where
   jobs : Option Nat := none
   shorter := false
   tactics := false
+  /-- `--tactics` was given, not only implied by `--compress`. -/
+  speed := false
   compress := false
+  cosmetic := false
+  unused := false
+  layout := false
+  propose : Option String := none
   minSaving : Nat := 1
 
 def usage : String :=
-  "usage: leanperf [--lsp] [--rules R,…] [--apply] [--check] [--bench N] [--dedup] " ++
-  "[--dedup-pass {auto,syntax,elaborate}] [--tactics] [--compress] [--min-saving N] [--jobs N] [--shorter] [paths …]
+  "usage: leanperf --golf [--cosmetic] [--strip-comments] [--keep-unused] [--no-optimize] [--rounds N] [--jobs N] paths …\n" ++
+  "       leanperf [--lsp] [--rules R,…] [--apply] [--check] [--bench N] [--dedup] " ++
+  "[--dedup-pass {auto,syntax,elaborate}] [--tactics] [--compress] [--cosmetic] [--unused] [--layout] [--propose CMD] " ++
+  "[--min-saving N] [--jobs N] " ++
+  "[--shorter] [paths …]
 
 A Lean proof linter, batch rewriter and LSP server.
 
   paths            Lean files or directories
+  --golf           every shrinking pass in order, each edit checked: --unused, --dedup, rounds of
+                   --unused and --compress until nothing changes, then --tactics. With
+                   --cosmetic also byte-only edits and --layout, --strip-comments first deletes
+                   comments, --keep-unused keeps theorems nothing uses, --no-optimize skips --tactics
   --lsp            serve LSP over stdio
   --list-lints     show the lint names, modes and descriptions
   --rules R,…      enable only these lints within the chosen mode
@@ -428,7 +481,15 @@ A Lean proof linter, batch rewriter and LSP server.
   --tactics        replace tactics with cheaper ones that close the same goals, and drop
                    `set_option … in` overrides a command does not need (elaborates the target)
   --min-saving N   with --tactics, the smallest saving worth an edit, in heartbeats (default 1)
-  --compress       replace tactic proofs with shorter local or library proofs; implies --tactics --shorter --check
+  --compress       take tactic steps and declarations out of proofs, each edit checked; implies
+                   --shorter --check. Add --tactics for the lints that make tactics cheaper
+  --cosmetic       with --compress, also the lints that only save bytes, such as shorter names
+  --unused         delete theorems that nothing else in the project mentions, reading only
+                   source text; run from the project root
+  --layout         join lines that fit within 100 columns when the command parses the same
+                   (with --rules stripComments,joinLines, also delete comments inside declarations)
+  --propose CMD    send each theorem to the shell command CMD and keep the shortest rewrite it
+                   proposes that Lean accepts with the same statement; implies --check
   --jobs N         parallel workers for skeletons and batch tactic replay (default 2)
   --shorter        select only replacements that shrink the source in UTF-8
 "
@@ -455,8 +516,12 @@ def parseArgs (argv : List String) : Except String Args := do
     | "--check" => a := { a with check := true }
     | "--dedup" => a := { a with dedup := true }
     | "--shorter" => a := { a with shorter := true }
-    | "--tactics" => a := { a with tactics := true }
+    | "--tactics" => a := { a with tactics := true, speed := true }
+    | "--cosmetic" => a := { a with cosmetic := true }
     | "--compress" => a := { a with tactics := true, shorter := true, check := true, compress := true }
+    | "--unused" => a := { a with unused := true }
+    | "--layout" => a := { a with layout := true }
+    | "--propose" => let (v, r) ← take; rest := r; a := { a with propose := some v, shorter := true, check := true }
     | "--rules" => let (v, r) ← take; rest := r; selected := some (v.splitOn ",")
     | "--allow" | "-A" => let (v, r) ← take; rest := r; allowed := allowed ++ v.splitOn ","
     | "--bench" =>
@@ -480,21 +545,32 @@ def parseArgs (argv : List String) : Except String Args := do
       if x.startsWith "-" then throw s!"unrecognized arguments: {x}"
       a := { a with paths := a.paths.push x }
   if let some j := a.jobs then
-    if j < 1 || !(a.dedup || a.dedupPass.isSome || a.tactics) || a.dedupPass == some "syntax" then
-      throw "--jobs requires a positive integer and an elaborated or auto pass"
+    if j < 1 || !(a.dedup || a.dedupPass.isSome || a.tactics || a.layout || a.propose.isSome) ||
+        a.dedupPass == some "syntax" then
+      throw "--jobs requires a positive integer and an elaborated, auto or layout pass"
   if a.lsp && a.shorter then throw "--shorter requires batch input"
   a := { a with dedup := a.dedup || a.dedupPass.isSome }
   if (a.lsp && (a.paths.size > 0 || a.apply || a.check || a.bench > 0 || a.dedup || a.tactics)) ||
       !(a.lsp || a.paths.size > 0) then
     throw "select --lsp alone or supply Lean paths with batch options"
   if a.dedup && a.tactics then throw "--dedup and --tactics are separate passes"
+  if a.unused && (a.dedup || a.tactics || a.lsp) then throw "--unused is a separate pass"
+  if a.layout && (a.dedup || a.tactics || a.unused || a.lsp) then throw "--layout is a separate pass"
+  if a.propose.isSome && (a.dedup || a.tactics || a.unused || a.layout || a.lsp) then
+    throw "--propose is a separate pass"
   let available := if a.dedup then match a.dedupPass with
       | some "syntax" => ["syntacticDuplicate"]
       | some "elaborate" => ["duplicate", "specialCase"]
       | _ => Lints.names "dedup"
     else if a.tactics then Lints.names "tactics" ++ (if a.compress then Lints.names "compress" else [])
+    else if a.unused then Lints.names "unused"
+    else if a.layout then Lints.names "layout"
+    else if a.propose.isSome then Lints.names "propose"
     else ruleNames
-  let wanted := selected.getD available
+  -- `--compress` takes steps and declarations out of proofs. Lints that only save bytes wait for
+  -- `--cosmetic`, and those that make tactics cheaper for `--tactics`.
+  let wanted := selected.getD (available.filter fun n => !Lints.optIn.contains n &&
+    (a.cosmetic || !Lints.cosmetic.contains n) && !(a.compress && !a.speed && (Lints.names "tactics").contains n))
   unless (wanted ++ allowed).all available.contains do
     throw s!"available lints in this mode: {", ".intercalate available}"
   return { a with rules := available.filter fun r => wanted.contains r && !allowed.contains r }
@@ -504,12 +580,15 @@ def label (path : FilePath) : IO String := do
   let p := path.toString
   return if p.startsWith cwd then (p.drop cwd.length).toString else p
 
-/-- Report and rewrite each file. `verify` elaborates a candidate, throwing on failure. -/
+/-- Report and rewrite each file. `verify` elaborates a candidate, throwing on failure. With
+    `atomic`, edits in different files depend on each other: nothing is written unless every
+    file succeeds. -/
 def runBatch (paths : Array FilePath) (args : Args) (an : Analyzer)
-    (verify : FilePath → String → IO Unit) : IO UInt32 := do
+    (verify : FilePath → String → IO Unit) (atomic := false) : IO UInt32 := do
   let mut failed := 0
   let mut count := 0
   let mut skipped := 0
+  let mut pending := #[]
   for path in paths do
     let lbl ← label path
     try
@@ -531,12 +610,21 @@ def runBatch (paths : Array FilePath) (args : Args) (an : Analyzer)
             times := times.modify variant (·.push t)
         IO.eprintln s!"{lbl}: original {fmt2 (median times[0]!)}s, rewritten {fmt2 (median times[1]!)}s (median of {args.bench} Lake checks each)"
       else if args.check then verify path new
-      if args.apply then save path original new
+      if args.apply then
+        if atomic then pending := pending.push (path, original, new) else save path original new
       else IO.print (unifiedDiff text new s!"a/{lbl}" s!"b/{lbl}")
       count := count + n
     catch e =>
       IO.eprintln s!"{lbl}: {e}"
       failed := failed + 1
+  if atomic && !pending.isEmpty then
+    if failed > 0 then
+      IO.eprintln s!"wrote none of the {pending.size} rewritten files, since their edits depend on each other"
+      count := 0
+    else
+      for (path, original, new) in pending do
+        try save path original new
+        catch e => IO.eprintln s!"{← label path}: {e}"; failed := failed + 1
   IO.eprintln s!"{count} edits, {skipped} unparsed commands, {failed} failed files"
   return if failed > 0 then 1 else 0
 
@@ -814,7 +902,75 @@ def runServer (env : Environment) (rules : List String) : IO UInt32 := do
 
 /-! ## Entry point -/
 
+/-- `leanperf --golf PATHS`: every pass that shrinks proofs, in the order that lets each feed the
+    next. Theorems that nothing uses go first, so that no later pass works on them and more helpers
+    have one user to fold into; then duplicates cite the theorem they restate; then rounds of
+    `--unused` and `--compress` take steps and declarations out of proofs until a round changes
+    nothing; and last `--tactics` makes the remaining steps cheaper. Each pass is this program run
+    again, and writes only edits that Lean has checked. -/
+def golf (argv : List String) : IO UInt32 := do
+  let mut cosmetic := false
+  let mut strip := false
+  let mut unused := true
+  let mut optimize := true
+  let mut rounds := 6
+  let mut extra : Array String := #[]
+  let mut paths : Array String := #[]
+  let mut rest := argv.filter (· != "--golf")
+  while let a :: r := rest do
+    rest := r
+    match a with
+    | "--cosmetic" => cosmetic := true
+    | "--strip-comments" => strip := true
+    | "--keep-unused" => unused := false
+    | "--no-optimize" => optimize := false
+    | "--rounds" | "--jobs" =>
+      let v :: r := rest | IO.eprintln s!"leanperf: error: {a} needs a value"; return 2
+      rest := r
+      if a == "--rounds" then rounds := v.toNat! else extra := extra ++ #[a, v]
+    | _ =>
+      if a.startsWith "-" then IO.eprintln s!"leanperf: error: --golf does not take {a}"; return 2
+      paths := paths.push a
+  if paths.isEmpty then IO.eprintln "leanperf: error: --golf needs paths"; return 2
+  let files ← Project.files (paths.map FilePath.mk)
+  let size : IO Nat := files.foldlM (fun n p => return n + (← IO.FS.readBinFile p).size) 0
+  let mut failed := false
+  let pass (args : Array String) : IO (Nat × Bool) := do
+    let o ← IO.Process.output { cmd := (← IO.appPath).toString, args := args ++ extra ++ paths }
+    let summary := (o.stderr.splitOn "\n").reverse.find? (·.endsWith "failed files")
+    let n := (summary.bind (·.splitOn " edits" |>.head?.bind String.toNat?)).getD 0
+    if o.exitCode != 0 then
+      IO.eprintln s!"{" ".intercalate args.toList}: {(o.stderr.trimAscii.toString.splitOn "\n").getLastD ""}"
+    return (n, o.exitCode != 0)
+  IO.println s!"start: {← size} bytes"
+  if strip then
+    let (n, f) ← pass #["--layout", "--rules", "stripComments,joinLines", "--apply", "--check"]
+    failed := failed || f
+    IO.println s!"comments: {n} edits, {← size} bytes"
+  if unused then
+    let (n, f) ← pass #["--unused", "--check", "--apply"]
+    failed := failed || f
+    IO.println s!"unused theorems: {n} edits, {← size} bytes"
+  let (n, f) ← pass #["--dedup", "--check", "--apply"]
+  failed := failed || f
+  IO.println s!"duplicates: {n} edits, {← size} bytes"
+  for i in [1:rounds + 1] do
+    let (u, f) ← if unused && i > 1 then pass #["--unused", "--check", "--apply"] else pure (0, false)
+    failed := failed || f
+    let (c, f) ← pass (#["--compress", "--apply"] ++ (if cosmetic then #["--cosmetic"] else #[]))
+    failed := failed || f
+    let (l, f) ← if cosmetic then pass #["--layout", "--apply", "--check"] else pure (0, false)
+    failed := failed || f
+    IO.println s!"round {i}: {u} unused, {c} compress and {l} layout edits, {← size} bytes"
+    if u + c + l == 0 then break
+  if optimize then
+    let (n, f) ← pass #["--tactics", "--apply", "--check"]
+    failed := failed || f
+    IO.println s!"cheaper tactics: {n} edits, {← size} bytes"
+  return if failed then 1 else 0
+
 unsafe def run (argv : List String) : IO UInt32 := do
+  if argv.contains "--golf" then return ← golf argv
   if argv == ["--list-lints"] then
     for lint in Lints.catalog do IO.println s!"{lint.name}\t{lint.group}\t{lint.description}"
     return 0
@@ -823,13 +979,20 @@ unsafe def run (argv : List String) : IO UInt32 := do
     | .error "help" => IO.print usage; return 0
     | .error e => IO.eprint usage; IO.eprintln s!"leanperf: error: {e}"; return 2
   try
-    if args.dedup || args.tactics then
+    if args.unused then
+      let paths ← Project.files args.paths
+      return ← runBatch paths args (← unusedAnalyzer (← IO.currentDir) paths) (atomic := true)
+        fun p t => discard <| lakeCheck p t
+    if args.dedup || args.tactics || args.layout || args.propose.isSome then
       let paths ← Project.files args.paths
       let root ← IO.currentDir
-      let an ← if args.tactics then
+      let an ← if args.tactics || args.layout || args.propose.isSome then
           elaboratedAnalyzer root paths (jobs := args.jobs)
             (tacticSaving := args.minSaving) (shorter := args.shorter) (compress := args.compress)
-            (disabled := (Lints.names "tactics" ++ Lints.names "compress").filter (!args.rules.contains ·))
+            (layout := args.layout) (propose := args.propose)
+            (disabled := (Lints.names "tactics" ++ Lints.names "compress" ++ Lints.names "layout" ++
+              Lints.names "propose").filter
+              (!args.rules.contains ·))
         else dedupAnalyzer root paths (args.dedupPass.getD "auto") args.jobs args.rules
       try runBatch paths args an (skeletonVerify an) finally an.close
     else

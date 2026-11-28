@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Candidates for `contractPair` from a local step-contraction model behind an OpenAI-compatible chat
+endpoint, such as `mlx_lm.server` (see scripts/ml/build21.py for its training data).
+
+It reads {"statement", "previous", "first", "second"} on standard input and writes
+{"candidates": [...]}: one-step replacements for the two steps. LeanPerf checks every candidate.
+
+Environment:
+  LEANPERF_PAIR_URL      chat completions endpoint (default: http://127.0.0.1:8090/v1/chat/completions)
+  LEANPERF_PAIR_SAMPLES  how many to sample at once (default: 6)
+"""
+import json
+import os
+import sys
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ml"))
+import pairprompt  # noqa: E402
+
+
+def complete(url, messages, temperature):
+    body = json.dumps({"messages": messages, "temperature": temperature, "max_tokens": 96}).encode()
+    req = urllib.request.Request(url, body, {"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            choice = json.load(r)["choices"][0]
+    except (OSError, ValueError, KeyError, IndexError):
+        return None
+    if choice.get("finish_reason") == "length":
+        return None
+    return choice["message"]["content"]
+
+
+def main():
+    req = json.load(sys.stdin)
+    url = os.environ.get("LEANPERF_PAIR_URL", "http://127.0.0.1:8090/v1/chat/completions")
+    samples = int(os.environ.get("LEANPERF_PAIR_SAMPLES", "6"))
+    steps = req.get("steps") or [req["first"], req["second"]]
+    user = pairprompt.message(req.get("statement", ""), req.get("previous", []), steps,
+                              req.get("goal", "") if os.environ.get("LEANPERF_PAIR_GOAL", "1") != "0" else "")
+    messages = [{"role": "system", "content": pairprompt.SYSTEM}, {"role": "user", "content": user}]
+    temps = [0.0] + [0.8] * (samples - 1)
+    with ThreadPoolExecutor(len(temps)) as pool:
+        answers = list(pool.map(lambda t: complete(url, messages, t), temps))
+    out = []
+    for a in answers:
+        if not a:
+            continue
+        a = a.strip().strip("`").strip()
+        # One step on one line; LeanPerf keeps it if it has fewer steps than the ones it replaces.
+        if a and "\n" not in a and not pairprompt.glued(steps, a) and a not in out:
+            out.append(a)
+    json.dump({"candidates": out}, sys.stdout)
+
+
+if __name__ == "__main__":
+    main()

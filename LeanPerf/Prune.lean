@@ -23,7 +23,8 @@ private partial def collect (stx : Syntax) (s : Uses) : Uses := Id.run do
   for child in stx.getArgs do s := collect child s
   return s
 
-private def wholeLines? (input : String) (map : FileMap) (r : Syntax.Range) : Option Syntax.Range := do
+/-- The lines that `r` occupies, when nothing else shares them and no comment is involved. -/
+def wholeLines? (input : String) (map : FileMap) (r : Syntax.Range) : Option Syntax.Range := do
   let start := map.ofPosition { map.toPosition r.start with column := 0 }
   let stop := map.ofPosition { line := (map.toPosition r.stop).line + 1, column := 0 }
   guard (String.Pos.Raw.extract input start r.start).trimAscii.isEmpty
@@ -41,14 +42,54 @@ private def removeRanges (input : String) (r : Syntax.Range) (drops : Array Synt
     cursor := d.stop
   return out ++ String.Pos.Raw.extract input cursor r.stop
 
-/-- Try removing a group together. On failure, bisect the group and recheck each new combination
-    with all accepted deletions. The returned proof is a single edit so competing suggestions
-    cannot introduce references to locals it removes. -/
+/-- Whether a rewritten theorem still states the same thing: by default the same exported type,
+    including binder names, and the same universe parameters. -/
+abbrev Accept := Environment → TheoremVal → TheoremVal → IO Bool
+
+def sameType : Accept := fun _ old new =>
+  pure (old.type.equal new.type && old.levelParams == new.levelParams)
+
+/-- The deletions from `candidates` that a theorem survives together with `fixed`. Try the whole
+    group; on failure, bisect it and recheck each half with everything accepted so far. The
+    rewritten theorem must satisfy `accept`, and its proof must contain no `sorry`. -/
+def deletions (input : String) (map : FileMap) (cmd : Syntax) (pctx : Parser.ParserModuleContext)
+    (ctx : Command.Context) (before after : Command.State) (candidates : Array Syntax.Range)
+    (fixed : Array Syntax.Range := #[]) (trials := 7) (accept : Accept := sameType) :
+    IO (Array Syntax.Range) := do
+  if candidates.isEmpty then return #[]
+  let some cmd := Signature.asTheorem? cmd | return #[]
+  let some name := Signature.theoremName? cmd[1] before after | return #[]
+  let some (.thmInfo old) := after.env.find? name | return #[]
+  let some r := cmd.getRange? | return #[]
+  let r := { r with start := map.ofPosition { map.toPosition r.start with column := 0 } }
+  let probe := { before with messages := {}, infoState := { enabled := false } }
+  let mut accepted := #[]
+  let mut todo := #[candidates]
+  for _ in [:trials] do
+    let some group := todo.back? | break
+    todo := todo.pop
+    let ictx := Parser.mkInputContext (removeRanges input r (fixed ++ accepted ++ group)) ctx.fileName
+    let (next, ps, msgs) := Parser.parseCommand ictx pctx {} {}
+    let (eof, _, msgs) := Parser.parseCommand ictx pctx ps msgs
+    if !msgs.hasErrors && Parser.isTerminalCommand eof then
+      let c := { ctx with fileMap := ictx.fileMap, cmdPos := 0 }
+      if let .ok ((), s) ← ((Command.elabCommandTopLevel next).run c |>.run probe).toIO' then
+        if let some (.thmInfo new) := s.env.find? name then
+          if !s.messages.hasErrors && !new.value.hasSorry && (← accept s.env old new) then
+            accepted := accepted ++ group
+            continue
+    if group.size > 1 then
+      let mid := group.size / 2
+      todo := (todo.push (group.extract mid group.size)).push (group.extract 0 mid)
+  return accepted
+
+/-- Remove named local proofs that nothing names. The returned proof is a single edit so
+    competing suggestions cannot introduce references to locals it removes. -/
 def proof? (input : String) (map : FileMap) (cmd : Syntax) (pctx : Parser.ParserModuleContext)
     (ctx : Command.Context) (before after : Command.State) : IO (Option Lsp.TextEdit) := do
-  unless cmd.isOfKind ``Parser.Command.declaration do return none
-  let d := cmd[1]
-  unless d.isOfKind ``Parser.Command.theorem && d[3].isOfKind ``Parser.Command.declValSimple do return none
+  let some thm := Signature.asTheorem? cmd | return none
+  let d := thm[1]
+  unless d[3].isOfKind ``Parser.Command.declValSimple do return none
   let proof := d[3][1]
   unless proof.isOfKind ``Parser.Term.byTactic do return none
   let some pr := proof.getRange? | return none
@@ -58,32 +99,7 @@ def proof? (input : String) (map : FileMap) (cmd : Syntax) (pctx : Parser.Parser
     let span ← wholeLines? input map r
     guard (pr.start ≤ span.start && span.stop ≤ pr.stop)
     return span
-  if candidates.isEmpty then return none
-  let some name := Signature.theoremName? d before after | return none
-  let some (.thmInfo old) := after.env.find? name | return none
-  let some r := cmd.getRange? | return none
-  let r := { r with start := map.ofPosition { map.toPosition r.start with column := 0 } }
-  let probe := { before with messages := {}, infoState := { enabled := false } }
-  let mut accepted := #[]
-  let mut todo := #[candidates]
-  for _ in [:7] do
-    let some group := todo.back? | break
-    todo := todo.pop
-    let trial := accepted ++ group
-    let ictx := Parser.mkInputContext (removeRanges input r trial) ctx.fileName
-    let (next, ps, msgs) := Parser.parseCommand ictx pctx {} {}
-    let (eof, _, msgs) := Parser.parseCommand ictx pctx ps msgs
-    if !msgs.hasErrors && Parser.isTerminalCommand eof then
-      let c := { ctx with fileMap := ictx.fileMap, cmdPos := 0 }
-      if let .ok ((), s) ← ((Command.elabCommandTopLevel next).run c |>.run probe).toIO' then
-        if let some (.thmInfo new) := s.env.find? name then
-          if !s.messages.hasErrors && !new.value.hasSorry && old.type.equal new.type &&
-              old.levelParams == new.levelParams then
-            accepted := trial
-            continue
-    if group.size > 1 then
-      let mid := group.size / 2
-      todo := (todo.push (group.extract mid group.size)).push (group.extract 0 mid)
+  let accepted ← deletions input map cmd pctx ctx before after candidates
   if accepted.isEmpty then return none
   return some { range := map.utf8RangeToLspRange pr, newText := removeRanges input pr accepted }
 
