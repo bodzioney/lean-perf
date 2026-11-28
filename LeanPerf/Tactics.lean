@@ -179,6 +179,17 @@ private def trySite (map : FileMap) (s : Site) (text : String) (budget : Nat)
     sugg := sugg ++ r.suggestions
   return some (total, goals, sugg)
 
+/-- `text` written at column `col`: its lines after the first move right by `col`, keeping their
+    indentation relative to the first. Lean wraps a long `Try this:` suggestion at its own width and
+    starts the next line at column 4; after an inline `by`, as in `have h : t := by simpa … using`,
+    that is left of the tactic block, and the term after `using` ends at its head. -/
+def placeAt (text : String) (col : Nat) : String :=
+  match text.splitOn "\n" with
+  | first :: rest@(_ :: _) =>
+    let pad := String.ofList (List.replicate col ' ')
+    "\n".intercalate (first :: rest.map fun l => if l.trimAscii.isEmpty then l else pad ++ l)
+  | _ => text
+
 def tacticEdits (input : String) (map : FileMap) (tree : InfoTree) (minSaving : Nat) (shorter : Bool) :
     IO (Array Edit) := do
   let mut edits := #[]
@@ -206,7 +217,7 @@ def tacticEdits (input : String) (map : FileMap) (tree : InfoTree) (minSaving : 
       edits := edits.push {
         rule := "fasterTactic"
         message := s!"{s.text.take 60} → {c.take 60}: {base / 1000} → {cost / 1000} heartbeats"
-        range := map.utf8RangeToLspRange s.range, newText := c }
+        range := map.utf8RangeToLspRange s.range, newText := placeAt c (map.toPosition s.range.start).column }
   return edits
 
 /-- The optional `only` and bracketed arguments of a simplifier call. -/
