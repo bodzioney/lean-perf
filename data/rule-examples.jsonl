@@ -2217,3 +2217,86 @@
 {"steps": ["simp only [gridParam_add_lowering, mem_image, mem_univ, true_and]", "rw [D.gridBlockEquiv.exists_congr_left]"], "merged": "simp [gridParam_add_lowering, mem_image, mem_univ, true_and, D.gridBlockEquiv.exists_congr_left]", "source": "rh-rules"}
 {"steps": ["rw [abs_sub_comm]", "exact h_main h_sign.symm (by grind)"], "merged": "grind", "source": "rh-rules"}
 {"steps": ["rw [mem_Ico] at hl'", "omega"], "merged": "grind", "source": "rh-rules"}
+{"steps": ["rw [← X.map_comp_apply]", "exact hx K (f ≫ φ) hK"], "merged": "simpa using hx K (f ≫ φ) hK", "source": "learn-rules"}
+{"steps": ["refine ⟨f, hf_ne, fun B' ψ hψ ↦ (hI B' ψ).2 ?_⟩", "exact eq_top_of_isUnit_mem _ (mem_map_of_mem _ hf) hψ"], "merged": "exact ⟨f, hf_ne, fun B' ψ hψ ↦ (hI B' ψ).2 <| eq_top_of_isUnit_mem _ (mem_map_of_mem _ hf) hψ⟩", "source": "learn-rules"}
+{"steps": ["rcases le_total (m i) (m i.rev) with h_le | h_le", "· exact ⟨i, h_le, hi⟩", "· exact ⟨i.rev, by rwa [Fin.rev_rev], by rwa [Fin.rev_rev, mul_comm]⟩"], "merged": "grind", "source": "learn-rules"}
+{"steps": ["obtain ⟨I, hI⟩ := hV A x", "obtain ⟨J, hJ⟩ := hW A x"], "merged": "rcases hV A x, hW A x with ⟨⟨I, hI⟩, J, hJ⟩", "source": "learn-rules"}
+{"steps": ["field_simp", "push_cast"], "merged": "push_cast [field]", "source": "learn-rules"}
+{"steps": ["obtain ⟨J, hJ⟩ := IsSeparatedFunctor.exists_ideal A x.2 y.2", "refine ⟨I ⊔ J, fun B φ ↦ ?_⟩"], "merged": "refine (IsSeparatedFunctor.exists_ideal A x.2 y.2).elim fun J hJ ↦ ⟨I ⊔ J,fun B φ ↦ ?_⟩", "source": "learn-rules"}
+{"steps": ["rw [X.map_comp_apply]", "exact h_sub B ω (isUnit_of_mul_isUnit_left hψr)"], "merged": "simpa using h_sub B ω (isUnit_of_mul_isUnit_left hψr)", "source": "learn-rules"}
+{"steps": ["have : Smooth k (MvPolynomial (Fin d) k) := {}", "have : Smooth (MvPolynomial (Fin d) k) a.coordRing := a.etale.instSmooth"], "merged": "have : Smooth (MvPolynomial (Fin d) k) a.coordRing := a.etale.instSmooth", "source": "learn-rules"}
+{"steps": ["rw [← funext hφ]", "exact comp_aeval_apply _ φ.hom p"], "merged": "rw [← funext hφ, comp_aeval_apply _ φ.hom p]", "source": "learn-rules"}
+{"steps": ["have h_split : g * (z, k) = g * (z, 1) * (1, k) := by simp [mul_assoc]", "rw [h_split, h_level k hk]"], "merged": "rw [show g * (z, k) = g * (z, 1) * (1, k) from by simp [mul_assoc], h_level k hk]", "source": "learn-rules"}
+{"steps": ["rw [h_move]", "exact h_inv ν (Space.mem_dilationGroup_of_ratEmbed_mem_radical (W := V.move g) hν) _"], "merged": "simp [h_move, h_inv _ (Space.mem_dilationGroup_of_ratEmbed_mem_radical (W := V.move g) hν)]", "source": "learn-rules"}
+{"steps": ["change F (g * ((V.move g).ratEmbed ν * x)) = F (g * x)", "simp [h_move, h_inv _ (Space.mem_dilationGroup_of_ratEmbed_mem_radical (W := V.move g) hν)]"], "merged": "simp [h_move, h_inv _ (Space.mem_dilationGroup_of_ratEmbed_mem_radical (W := V.move g) hν)]", "source": "learn-rules"}
+{"steps": ["have : FormallyEtale (MvPolynomial (Fin d) k) R := h_et.formallyEtale", "obtain ⟨s, hs, h_unique⟩ := existsUnique_algHom_lift ζ' π' h_surj ⟨2, h_sq⟩"], "merged": "obtain ⟨s, hs, h_unique⟩ := existsUnique_algHom_lift ζ' π' h_surj ⟨2, h_sq⟩", "source": "learn-rules"}
+{"steps": ["obtain ⟨φ, rfl⟩ := a.mem_locus_iff.1 hx", "obtain ⟨ψ, rfl⟩ := b.mem_locus_iff.1 hy"], "merged": "rcases a.mem_locus_iff.1 hx, b.mem_locus_iff.1 hy with ⟨⟨φ, rfl⟩, ψ, rfl⟩", "source": "learn-rules"}
+{"steps": ["obtain ⟨a, ha⟩ := exists_chart (d := d) K hK x₁", "obtain ⟨b, hb⟩ := exists_chart (d := n) K hK x₂"], "merged": "rcases exists_chart (d := d) K hK x₁, exists_chart (d := n) K hK x₂ with ⟨⟨a, ha⟩, b, hb⟩", "source": "learn-rules"}
+{"steps": ["obtain ⟨K, h_level⟩ := hF.exists_level", "obtain ⟨c, hc⟩ := hF.bounded"], "merged": "rcases hF.exists_level, hF.bounded with ⟨⟨K, h_level⟩, c, hc⟩", "source": "learn-rules"}
+{"steps": ["have h_prod : IsUnit (φ (∏ j, x i S j)) := by simp [Finset.prod_ne_zero_iff, h_ne]", "exact ⟨(i, S), (mem_locus_away _ _ φ).2 h_prod⟩"], "merged": "exact ⟨(i, S), (mem_locus_away _ _ φ).2 (by simp [Finset.prod_ne_zero_iff, h_ne])⟩", "source": "learn-rules"}
+{"steps": ["rw [Fin.val_rev, Fin.val_rev]", "omega"], "merged": "grind", "source": "learn-rules"}
+{"steps": ["have h_succ : i.val + 1 = j.val := Nat.covBy_iff_add_one_eq.mp (Fin.covBy_iff.mp h)", "grind"], "merged": "grind [Nat.covBy_iff_add_one_eq.mp (Fin.covBy_iff.mp h)]", "source": "learn-rules"}
+{"steps": ["rw [Complex.ofReal_ne_zero, norm_ne_zero_iff]", "exact (t p.2 / t p.1).ne_zero"], "merged": "simp", "source": "learn-rules"}
+{"steps": ["obtain ⟨hg_basic, hg_cols⟩ := hg", "obtain ⟨hk_int, -⟩ := mem_blockParahoric.mp hk"], "merged": "rcases hg, mem_blockParahoric.mp hk with ⟨⟨hg_basic, hg_cols⟩, hk_int, -⟩", "source": "learn-rules"}
+{"steps": ["obtain ⟨hy₀, hy_fix, hy_eig⟩ := h_eig", "have hB_pos : ∀ z : ρ, z ≠ 0 → 0 < B z z := hB.pos"], "merged": "obtain ⟨⟨hy₀, hy_fix, hy_eig⟩, hB_pos⟩ := And.intro (h_eig) (hB.pos)", "source": "learn-rules"}
+{"steps": ["rw [h_det, hg3, ← exp_add]", "congr 1"], "merged": "rw [h_det, hg3, ← exp_add]", "source": "learn-rules"}
+{"steps": ["subst hab", "rw [diagonal_apply_eq]"], "merged": "rw [hab, diagonal_apply_eq]", "source": "learn-rules"}
+{"steps": ["rw [diagonal_apply_ne _ hab, map_zero]", "exact _root_.zero_le"], "merged": "simp [diagonal_apply_ne _ hab]", "source": "learn-rules"}
+{"steps": ["dsimp only [z]", "rw [diagonal_mul]"], "merged": "simp only [z, diagonal_mul]", "source": "learn-rules"}
+{"steps": ["rw [zero_mul, map_zero]", "exact _root_.zero_le"], "merged": "simp", "source": "learn-rules"}
+{"steps": ["have hba := h b a", "dsimp only [z] at hba"], "merged": "have hba := h b a", "source": "learn-rules"}
+{"steps": ["rw [Matrix.map_apply]", "dsimp only [z]"], "merged": "simp only [Matrix.map_apply, z]", "source": "learn-rules"}
+{"steps": ["subst hab", "rw [diagonal_apply_eq, diagonal_apply_eq]"], "merged": "rw [hab, diagonal_apply_eq, diagonal_apply_eq]", "source": "learn-rules"}
+{"steps": ["congr 1", "refine Finset.prod_congr rfl fun a _ ↦ ?_"], "merged": "congr! 2 with a _ _", "source": "learn-rules"}
+{"steps": ["rw [diagonal_apply_ne _ hab, diagonal_apply_ne _ hab]", "exact (residueOrZero_coe 0).trans (IsLocalRing.residue _).map_zero"], "merged": "simp [diagonal_apply_ne _ hab]", "source": "learn-rules"}
+{"steps": ["rw [mulVec_diagonal, Pi.zero_apply] at hi'", "simp only [hi, ↓reduceIte, one_mul] at hi'"], "merged": "simp only [mulVec_diagonal, Pi.zero_apply, hi, ↓reduceIte, one_mul] at hi'", "source": "learn-rules"}
+{"steps": ["have hi' := h i", "simp only [mulVec_diagonal, Pi.zero_apply, hi, ↓reduceIte, one_mul] at hi'", "exact hi'"], "merged": "simpa [mulVec_diagonal, Pi.zero_apply, hi] using (h i)", "source": "learn-rules"}
+{"steps": ["obtain ⟨hg_par, hg_diag⟩ := mem_proIwahori_iff_blockParahoric.mp hg", "obtain ⟨hg_int, hg_low⟩ := mem_blockParahoric.mp hg_par"], "merged": "obtain ⟨⟨hg_int, hg_low⟩, hg_diag⟩ := mem_proIwahori_iff_blockParahoric.mp hg", "source": "learn-rules"}
+{"steps": ["simp_rw [h_val, ← h_card]", "simpa using (prod_fiberwise' c fun a ↦ X - C (g a)).symm"], "merged": "simpa [h_val, ← h_card] using (prod_fiberwise' c fun a ↦ X - C (g a)).symm", "source": "learn-rules"}
+{"steps": ["have h_R_one : R 1 = 1 := by simpa using hR_apply 1", "simp [τ, mulSingle_apply, apply_ite, h_R_one]"], "merged": "simp [τ, mulSingle_apply, apply_ite, (by simpa using hR_apply 1)]", "source": "learn-rules"}
+{"steps": ["have h_ne : σ.symm i ≠ j := by grind [h_sep j (σ j) (hσ j)]", "simp [h_ne]"], "merged": "simp [show σ.symm i ≠ j from by grind [h_sep j (σ j) (hσ j)]]", "source": "learn-rules"}
+{"steps": ["rw [← hR_apply ⟨t, ht.le⟩]", "simp [hθ _ t ht, hτ_single]"], "merged": "simp [← hR_apply ⟨t, ht.le⟩, hθ _ t ht, hτ_single]", "source": "learn-rules"}
+{"steps": ["dsimp only [transposeGL]", "rw [transpose_apply]"], "merged": "simp only [transposeGL, transpose_apply]", "source": "learn-rules"}
+{"steps": ["simp only [transposeGL, transpose_apply]", "split_ifs <;> simp"], "merged": "split_ifs <;> simp [transposeGL]", "source": "learn-rules"}
+{"steps": ["dsimp only [transposeGL]", "rw [Matrix.det_transpose, h_det_inv, map_inv₀]"], "merged": "rw [transposeGL, Matrix.det_transpose, h_det_inv, map_inv₀]", "source": "learn-rules"}
+{"steps": ["rw [transposeGL, Matrix.det_transpose, h_det_inv, map_inv₀]", "simp only [Pi.inv_apply, h_prod_c]"], "merged": "simp only [transposeGL, Matrix.det_transpose, h_det_inv, map_inv₀, Pi.inv_apply, h_prod_c]", "source": "learn-rules"}
+{"steps": ["simp only [hb, ↓reduceIte, map_one, mul_one]", "exact (hg1 b a).trans h_le1"], "merged": "simpa [hb, ↓reduceIte, map_one, mul_one] using (hg1 b a).trans h_le1", "source": "learn-rules"}
+{"steps": ["rw [h_det, hg3, h_inv_exp, ← exp_add]", "congr 1"], "merged": "rw [h_det, hg3, h_inv_exp, ← exp_add]", "source": "learn-rules"}
+{"steps": ["have h_theta : ∀ j : ℕ, thetaBPlus (frobEnd^[j + 1] a) = 0 := by simp [hq]", "exact a.dvd_of_thetaBPlus_frobEnd_eq_zero tau_dvd_of_theta_frobEnd h_theta"], "merged": "exact a.dvd_of_thetaBPlus_frobEnd_eq_zero tau_dvd_of_theta_frobEnd (by simp [hq])", "source": "learn-rules"}
+{"steps": ["rw [← xi_mul_tau]", "exact c.associated_E_xi.mul_right tau"], "merged": "exact xi_mul_tau ▸ c.associated_E_xi.mul_right tau", "source": "learn-rules"}
+{"steps": ["have h_frob : linearFrob (decompRep r A) ⟨s, hsD⟩ 0 = 1 := h_crys.linearFrob_eq_one hk", "simp [h_frob]"], "merged": "simp [h_crys.linearFrob_eq_one hk]", "source": "learn-rules"}
+{"steps": ["have h_eval : aeval (r s).val (X - 1 : (PadicAlgCl ℓ)[X]) = 0 := (h_kill s hs).1 hℓ", "exact Units.ext (by simpa [sub_eq_zero] using h_eval)"], "merged": "exact Units.ext (by simpa [sub_eq_zero] using (h_kill s hs).1 hℓ)", "source": "learn-rules"}
+{"steps": ["rw [← mk_span_eq_iff_dvd_sub, map_prod, map_pow]", "simp only [h_factor, Finset.prod_const, Finset.card_range]"], "merged": "simp [← mk_span_eq_iff_dvd_sub, map_prod, map_pow, h_factor]", "source": "learn-rules"}
+{"steps": ["obtain ⟨pcr_r, kill_r⟩ := hr.2 (hs := hs) hk", "obtain ⟨pcr_μ, kill_μ⟩ := hμ.2 (hs := hs) hk"], "merged": "rcases hr.2 (hs := hs) hk, hμ.2 (hs := hs) hk with ⟨⟨pcr_r, kill_r⟩, pcr_μ, kill_μ⟩", "source": "learn-rules"}
+{"steps": ["rw [← card_coe, ← Module.finrank_fintype_fun_eq_card Ainf (η := d)]", "exact hb'.fintype_card_le_finrank"], "merged": "simpa using hb'.fintype_card_le_finrank", "source": "learn-rules"}
+{"steps": ["obtain ⟨W, hW⟩ := hU.exists_mul_eq_smul_one", "refine mulVec_injective_of_det_ne_zero fun h_det ↦ ?_"], "merged": "refine (hU.exists_mul_eq_smul_one).elim fun W hW ↦ mulVec_injective_of_det_ne_zero fun h_det ↦ ?_", "source": "learn-rules"}
+{"steps": ["rw [hy, Pi.smul_apply]", "exact amaxImage.smul_mem (amaxImage.algebraMap_mem (x j)) _"], "merged": "simp [hy, Pi.smul_apply, amaxImage.smul_mem (amaxImage.algebraMap_mem (x j))]", "source": "learn-rules"}
+{"steps": ["have h_scalar : decompRep r₁ A t x = (μ t.val).val • x := by simp [r₁]", "rwa [h_scalar, map_smulₛₗ] at ht"], "merged": "rwa [show decompRep r₁ A t x = (μ t.val).val • x from by simp [r₁], map_smulₛₗ] at ht", "source": "learn-rules"}
+{"steps": ["obtain ⟨W, hW⟩ := hU.exists_mulVec_mulVec_eq_smul", "obtain ⟨F, F', hF, hF', hUF⟩ := hU.exists_frob"], "merged": "rcases hU.exists_mulVec_mulVec_eq_smul, hU.exists_frob with ⟨⟨W, hW⟩, F, F', hF, hF', hUF⟩", "source": "learn-rules"}
+{"steps": ["have h_smul : l ⬝ᵥ tau ^ h • x = tau ^ h * l ⬝ᵥ x := by rw [dotProduct_smul, smul_eq_mul]", "simpa [h_smul, tau_ne_zero] using h_zero"], "merged": "simpa [dotProduct_smul, smul_eq_mul] using h_zero", "source": "learn-rules"}
+{"steps": ["rw [(Q.map _).eq_mul_inv_iff_mul_eq.mpr hB]", "refine sum_mem fun m _ ↦ hodgeFil_anti (hk m) ?_"], "merged": "refine (Q.map _).eq_mul_inv_iff_mul_eq.mpr hB ▸ sum_mem fun m _ ↦ hodgeFil_anti (hk m) ?_", "source": "learn-rules"}
+{"steps": ["rw [h_smul]", "simp [a₀, Θ, ha, hνi, coe_eq, pow_mul]"], "merged": "simp_all [h_smul, a₀, Θ, ha, hνi, coe_eq, pow_mul]", "source": "learn-rules"}
+{"steps": ["obtain ⟨S, hS⟩ := y.exists_finset", "obtain ⟨s, hs⟩ := exists_gp_eq_algHom γ"], "merged": "rcases y.exists_finset, exists_gp_eq_algHom γ with ⟨⟨S, hS⟩, s, hs⟩", "source": "learn-rules"}
+{"steps": ["have hMg : R * σ M.val = M.val := hM g", "have hNg : R * σ N.val = N.val := hN g"], "merged": "obtain ⟨hMg, hNg⟩ : R * σ M.val = M.val ∧ R * σ N.val = N.val := And.intro (hM g) (hN g)", "source": "learn-rules"}
+{"steps": ["rw [h_diag]", "simp only [← mulVec_mulVec, h_rows]"], "merged": "simp only [h_diag, ← mulVec_mulVec, h_rows]", "source": "learn-rules"}
+{"steps": ["by_contra h_ne", "exact hs ⟨Set.mem_image_of_mem μ hs_inertia, h_ne⟩"], "merged": "grind [Set.mem_image_of_mem μ hs_inertia]", "source": "learn-rules"}
+{"steps": ["rw [← hJ τ hτ]", "exact h hg"], "merged": "exact hJ τ hτ ▸ h hg", "source": "learn-rules"}
+{"steps": ["rw [hN_eq]", "exact lt_mul_of_one_lt_left hr_pos hl_prime.one_lt"], "merged": "exact (hN_eq ▸ lt_mul_of_one_lt_left hr_pos hl_prime.one_lt)", "source": "learn-rules"}
+{"steps": ["rw [h_single, modKernel_sum_left, h_twist]", "field_simp [Circle.coe_ne_zero]"], "merged": "simp [h_single, modKernel_sum_left, h_twist, field]", "source": "learn-rules"}
+{"steps": ["obtain ⟨p, hp⟩ := cyclotomic.dvd_X_pow_sub_one M R", "refine ⟨p.eval (ζ ^ l ^ a), ?_⟩"], "merged": "refine (cyclotomic.dvd_X_pow_sub_one M R).elim fun p hp ↦ ⟨p.eval (ζ ^ l ^ a), ?_⟩", "source": "learn-rules"}
+{"steps": ["have h1 := congrArg (Polynomial.eval (ζ ^ l ^ a)) hp", "simpa [expand_eval, ← pow_mul, ← hr_eq] using h1"], "merged": "simpa [expand_eval, ← pow_mul, ← hr_eq] using congrArg (Polynomial.eval (ζ ^ l ^ a)) hp", "source": "learn-rules"}
+{"steps": ["have h_fac : ((n : ZMod N) * (a + b) + 1) * (a - b) = 0 := by linear_combination hab", "exact sub_eq_zero.1 (h_unit.mul_left_cancel (by simpa using h_fac))"], "merged": "exact sub_eq_zero.1 (h_unit.mul_left_cancel (by simpa using (by linear_combination hab)))", "source": "learn-rules"}
+{"steps": ["rw [← ZMod.natCast_eq_zero_iff]", "push_cast"], "merged": "push_cast [← ZMod.natCast_eq_zero_iff]", "source": "learn-rules"}
+{"steps": ["push_cast [← ZMod.natCast_eq_zero_iff]", "rw [ZMod.natCast_zmod_val]"], "merged": "push_cast [← ZMod.natCast_eq_zero_iff, ZMod.natCast_zmod_val]", "source": "learn-rules"}
+{"steps": ["simp only [F, F', ha, ha']", "exact integral_sum_upIntegrand_eq_mul A' A U₁ U₂ (ν₀ i) h_theta"], "merged": "simp only [F, F', ha, ha', integral_sum_upIntegrand_eq_mul A' A U₁ U₂ (ν₀ i) h_theta]", "source": "learn-rules"}
+{"steps": ["rw [← h_up, ← h_down, ← integral_const_mul]", "exact integral_congr_ae (.of_forall h_exch_at)"], "merged": "rwa [← h_up, ← h_down, ← integral_const_mul, integral_congr_ae (.of_forall h_exch_at)]", "source": "learn-rules"}
+{"steps": ["have hV_mul : P.relDifferentGen s * (a ℓ - 1) * M ℓ = N * V ℓ := hV_eq ℓ", "linear_combination t * hV_mul"], "merged": "linear_combination t * hV_eq ℓ", "source": "learn-rules"}
+{"steps": ["have hN_C : ((P.q₀ : ℂ) * (towerDeg s : ℂ)) = (N : ℂ) := by exact_mod_cast rfl", "simpa [hN_C] using h1"], "merged": "simpa [show (P.q₀ : ℂ) * (towerDeg s : ℂ) = N from by exact_mod_cast rfl] using h1", "source": "learn-rules"}
+{"steps": ["have := congrArg (fun x : 𝓞 (P.E s) ↦ Φ σ (x : P.E s)) hβ_mul", "simpa [phi_betaKInE] using this"], "merged": "simpa [phi_betaKInE] using congrArg (fun x : 𝓞 (P.E s) ↦ Φ σ (x : P.E s)) hβ_mul", "source": "learn-rules"}
+{"steps": ["rw [hW_conj]", "simp only [W]"], "merged": "simp only [hW_conj, W]", "source": "learn-rules"}
+{"steps": ["simp only [hW_conj, W]", "field_simp [hN_C]"], "merged": "simp only [hW_conj, W, field]", "source": "learn-rules"}
+{"steps": ["simp only [hW_conj, W, field]", "push_cast"], "merged": "simp only [hW_conj, W, field, push_cast]", "source": "learn-rules"}
+{"steps": ["have hn0 : (n : ZMod p) = 0 := (ZMod.natCast_eq_zero_iff n p).2 hp_n", "simp [hN0, hn0]"], "merged": "simp [hN0, (ZMod.natCast_eq_zero_iff n p).2 hp_n]", "source": "learn-rules"}
+{"steps": ["have he' : n * z ^ 2 + z + 1 = N * e := he_eq", "have hz_le : z ≤ N := hz_lt.le"], "merged": "obtain ⟨he', hz_le⟩ : n * z ^ 2 + z + 1 = N * e ∧ z ≤ N := And.intro he_eq hz_lt.le", "source": "learn-rules"}
+{"steps": ["have hM : M ℓ ≤ N := hM_le ℓ", "have hz_le : z ≤ N := hz_lt.le"], "merged": "obtain ⟨hM, hz_le⟩ : M ℓ ≤ N ∧ z ≤ N := And.intro (hM_le ℓ) (hz_lt.le)", "source": "learn-rules"}
+{"steps": ["have h_mul : N * ((P.d + 2) * N ^ 2) = (P.d + 2) * N ^ 3 := by ring", "rw [h_mul]"], "merged": "rw [show N * ((P.d + 2) * N ^ 2) = (P.d + 2) * N ^ 3 by ring]", "source": "learn-rules"}
