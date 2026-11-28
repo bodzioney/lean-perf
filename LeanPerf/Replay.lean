@@ -70,6 +70,13 @@ def cap (ci : ContextInfo) : Nat :=
   let h := maxHeartbeats.get ci.options
   2 * 1000 * (if h == 0 then maxHeartbeats.defValue else h)
 
+/-- The budget for replaying steps of a declaration that took `spent` raw heartbeats to elaborate,
+    everything included: four times that and some slack, within `cap`. A replay of some of its steps
+    that needs more has left the path the elaborator took. In the Riemann project, whose
+    `maxHeartbeats` is 4,000,000, one replay unfolded a definition for hours within `cap` alone. -/
+def capFor (ci : ContextInfo) (spent : Nat) : Nat :=
+  if spent == 0 then cap ci else min (cap ci) (4 * spent + 20000000)
+
 structure Run where
   heartbeats : Nat
   goals : List (Expr × List Name)

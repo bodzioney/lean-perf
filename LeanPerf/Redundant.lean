@@ -198,7 +198,8 @@ private def sameUpToInstances (ci : ContextInfo) (a b : List (Expr × List Name)
     return true
 
 /-- Checked deletions inside the tactic proofs of one info tree, for the selected `rules`. -/
-def edits (input : String) (map : FileMap) (tree : InfoTree) (rules : List String) : IO (Array Edit) := do
+def edits (input : String) (map : FileMap) (tree : InfoTree) (rules : List String) (spent : Nat := 0) :
+    IO (Array Edit) := do
   let mut found := tree.foldInfo (init := #[]) fun ci info acc => Id.run do
     let .ofTacticInfo ti := info | return acc
     let some s := site? input map ti.stx | return acc
@@ -242,7 +243,7 @@ def edits (input : String) (map : FileMap) (tree : InfoTree) (rules : List Strin
     let some runs := runs? | continue
     let mut bases := #[]
     for (ci, mctx, g) in runs do
-      let some base ← Replay.run ci map mctx g s.original (Replay.cap ci) | break
+      let some base ← Replay.run ci map mctx g s.original (Replay.capFor ci spent) | break
       bases := bases.push base
     if bases.size < runs.size then continue
     for (candidate, range, newText) in s.options do

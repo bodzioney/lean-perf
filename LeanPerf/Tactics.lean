@@ -423,9 +423,11 @@ def analyze (env : Environment) (main : Name) (fileName input : String) (opts : 
       unless parseOnly do res := { res with errors := res.errors.push (← e.toMessageData.toString) }
       if proposer.isSome || fold then records := records.push { cmd, ctx, before, after := before }
     | .ok ((), after) =>
+      -- What the command cost to elaborate bounds what replaying its steps may cost.
+      let spent := (← IO.getNumHeartbeats) - h0
       if proposer.isSome || fold then
         records := records.push { cmd, ctx, before, after := if after.messages.hasErrors then before else after
-                                  heartbeats := (← IO.getNumHeartbeats) - h0 }
+                                  heartbeats := spent }
       if after.messages.hasErrors then
         for m in after.messages.toList do
           if m.severity == .error && res.errors.size < 5 && !parseOnly then
@@ -472,21 +474,21 @@ def analyze (env : Environment) (main : Name) (fileName input : String) (opts : 
                   | some q => String.Pos.Raw.extract input p q ++ ":= by"
                   | none => ""
                 | _, _ => ""
-              for e in ← Blocks.contractPairs input ictx.fileMap t (statement := statement) do
+              for e in ← Blocks.contractPairs input ictx.fileMap t (statement := statement) (spent := spent) do
                 res := { res with edits := res.edits.push {
                   rule := "contractPair", message := e.message,
                   range := ictx.fileMap.utf8RangeToLspRange e.range, newText := e.newText } }
             if steps then
-              for e in ← Blocks.unneededSteps input ictx.fileMap t do
+              for e in ← Blocks.unneededSteps input ictx.fileMap t (spent := spent) do
                 res := { res with edits := res.edits.push {
                   rule := "unneededStep", message := e.message,
                   range := ictx.fileMap.utf8RangeToLspRange e.range, newText := e.newText } }
             if blocks then
-              for e in ← Blocks.edits input ictx.fileMap t do
+              for e in ← Blocks.edits input ictx.fileMap t (spent := spent) do
                 res := { res with edits := res.edits.push {
                   rule := "shorterBlock", message := e.message,
                   range := ictx.fileMap.utf8RangeToLspRange e.range, newText := e.newText } }
-            for e in ← Redundant.edits input ictx.fileMap t redundant do
+            for e in ← Redundant.edits input ictx.fileMap t redundant (spent := spent) do
               res := { res with edits := res.edits.push {
                 rule := e.rule, message := e.message,
                 range := ictx.fileMap.utf8RangeToLspRange e.range, newText := e.newText } }

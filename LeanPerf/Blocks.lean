@@ -118,7 +118,7 @@ private def isPropGoal (map : FileMap) (r : Run) : IO Bool := do
     that searches is slower than the steps it finds. Of the closers that work, the cheapest. `suffixes` is the
     number of final steps tried as a group besides each whole sequence. -/
 def edits (input : String) (map : FileMap) (tree : InfoTree) (perStep : Nat := 100000)
-    (suffixes : Nat := 3) : IO (Array Edit) := do
+    (suffixes : Nat := 3) (spent : Nat := 0) : IO (Array Edit) := do
   let runs := runsByRange tree
   -- Outer sequences first: a closer for a whole block makes its inner blocks moot.
   let seqs := (sequences tree).qsort fun a b =>
@@ -162,7 +162,7 @@ def edits (input : String) (map : FileMap) (tree : InfoTree) (perStep : Nat := 1
       if had < 2 then continue
       let mut bases := #[]
       for s in sites do
-        let some b ← Replay.run s.ci map s.mctx s.goal suffix (Replay.cap s.ci) | break
+        let some b ← Replay.run s.ci map s.mctx s.goal suffix (Replay.capFor s.ci spent) | break
         unless b.goals.isEmpty do break
         bases := bases.push b.heartbeats
       if bases.size < sites.size then continue
@@ -218,7 +218,7 @@ def edits (input : String) (map : FileMap) (tree : InfoTree) (perStep : Nat := 1
     raw heartbeats for each byte saved. Steps are tried from the first, and each deletion is kept
     for the steps after it. A step is deleted only with the whole lines it takes. -/
 def unneededSteps (input : String) (map : FileMap) (tree : InfoTree) (perByte : Nat := 5000)
-    (maxSteps : Nat := 24) : IO (Array Edit) := do
+    (maxSteps : Nat := 24) (spent : Nat := 0) : IO (Array Edit) := do
   let runs := runsByRange tree
   let mut out : Array Edit := #[]
   for seq in sequences tree do
@@ -235,7 +235,7 @@ def unneededSteps (input : String) (map : FileMap) (tree : InfoTree) (perByte : 
       mkNode ``Parser.Tactic.tacticSeq #[mkNode ``Parser.Tactic.tacticSeq1Indented #[mkNullNode parts]]
     let mut bases := #[]
     for s in sites do
-      let some b ← Replay.run s.ci map s.mctx s.goal (build (Array.range n)) (Replay.cap s.ci) | break
+      let some b ← Replay.run s.ci map s.mctx s.goal (build (Array.range n)) (Replay.capFor s.ci spent) | break
       unless b.goals.isEmpty do break
       bases := bases.push b.heartbeats
     if bases.size < sites.size then continue
@@ -338,7 +338,8 @@ private def defaultProposer : IO (Option String) := do
     between steps may differ. After a contraction the pair before it is tried again, so a run of
     steps can shrink to one. -/
 def contractPairs (input : String) (map : FileMap) (tree : InfoTree) (perStep : Nat := 100000)
-    (maxSteps : Nat := 24) (maxChecks : Nat := 40) (statement := "") (width := 100) : IO (Array Edit) := do
+    (maxSteps : Nat := 24) (maxChecks : Nat := 40) (statement := "") (width := 100) (spent : Nat := 0) :
+    IO (Array Edit) := do
   let runs := runsByRange tree
   -- A proposer finds steps that no fixed rule knows: the command LEANPERF_PAIR_MODEL names, none
   -- when it is empty, and else the dictionary of LeanPerf's checkout (scripts/pair-dict).
@@ -346,6 +347,9 @@ def contractPairs (input : String) (map : FileMap) (tree : InfoTree) (perStep : 
     | some "" => pure none
     | some m => pure (some m)
     | none => defaultProposer
+  let debug := (← IO.getEnv "LEANPERF_PAIR_DEBUG").isSome
+  let trace (what : String) : IO Unit := do
+    if debug then IO.eprintln s!"contractPair: {what}"; (← IO.getStderr).flush
   let mut out : Array Edit := #[]
   for seq in sequences tree do
     let args := seq[0].getArgs
@@ -355,6 +359,7 @@ def contractPairs (input : String) (map : FileMap) (tree : InfoTree) (perStep : 
     let some sites := runs[key r0]? | continue
     let some sites := sites.mapM id | continue
     if sites.isEmpty then continue
+    trace s!"sequence at line {(map.toPosition r0.start).line}: prop goal?"
     unless ← sites.allM (isPropGoal map) do continue
     -- Each step: its syntax, text, the source it replaces, whether it is new, and where it starts
     -- (for a new step, where the first step it replaces started).
@@ -370,8 +375,9 @@ def contractPairs (input : String) (map : FileMap) (tree : InfoTree) (perStep : 
       mkNode ``Parser.Tactic.tacticSeq #[mkNode ``Parser.Tactic.tacticSeq1Indented
         #[mkNullNode (steps.foldl (fun acc s => acc.push s |>.push mkNullNode) #[] |>.pop)]]
     let mut bases := #[]
+    trace s!"  replay {cur.size} steps"
     for s in sites do
-      let some b ← Replay.run s.ci map s.mctx s.goal (build (cur.map (·.1))) (Replay.cap s.ci) | break
+      let some b ← Replay.run s.ci map s.mctx s.goal (build (cur.map (·.1))) (Replay.capFor s.ci spent) | break
       unless b.goals.isEmpty do break
       bases := bases.push b.heartbeats
     if bases.size < sites.size then continue
@@ -394,6 +400,7 @@ def contractPairs (input : String) (map : FileMap) (tree : InfoTree) (perStep : 
       -- before `grind` when both close the goal.
       let mut found : Option (Syntax × String × Nat) := none
       let fixed := pairCandidates input a b ta tb
+      trace s!"  pair {ta.take 60} / {tb.take 60}"
       let goal ← match model, ga with
         | some _, some g => goalText map g
         | _, _ => pure ""
@@ -415,6 +422,7 @@ def contractPairs (input : String) (map : FileMap) (tree : InfoTree) (perStep : 
         -- While the steps before the pair are the original ones, the goal recorded before the
         -- pair is where a replay of the whole sequence gets to, so a candidate that fails from
         -- there fails: only it and the steps after it are run. Most candidates fail.
+        trace s!"    candidate {c.take 80}"
         if let some g := ga then
           if !prefixChanged then
             let rest := build (#[stx] ++ (cur.extract (i + 2) cur.size).map (·.1))
