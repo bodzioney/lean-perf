@@ -1,3 +1,4 @@
+import LeanPerf.Edit
 import LeanPerf.Instances
 import LeanPerf.Steps
 
@@ -17,14 +18,8 @@ open Lean Elab
 
 namespace LeanPerf.Combine
 
-structure Edit where
-  range : Syntax.Range
-  newText : String
-  /-- The edit deletes instance binders, which changes the exported type by design. -/
-  dropsInstances : Bool := false
-  /-- The steps the edit takes out, or 1000 for each declaration (see `Steps.worth`). -/
-  gain : Nat := 0
-  deriving Inhabited
+/-- The edit deletes instance binders, which changes the exported type by design. -/
+private def dropsInstances (e : Edit) : Bool := e.rule == "unusedInstance"
 
 /-- What the edit is worth: steps and declarations first, then bytes. -/
 private def saving (e : Edit) : Int :=
@@ -46,27 +41,8 @@ def select (edits : Array Edit) (shorter : Bool) : Array Nat := Id.run do
         out := out.push i
         stop := edits[i]!.range.stop
     return out
-  -- Weighted interval scheduling by what the edits are worth.
   let byStop := (idx.filter (saving edits[·]! > 0)).qsort fun i j => edits[i]!.range.stop < edits[j]!.range.stop
-  let mut best : Array Int := #[0]
-  let mut prev : Array Nat := #[]
-  for h : k in [:byStop.size] do
-    let e := edits[byStop[k]]!
-    let mut lo := 0
-    let mut hi := k
-    while lo < hi do
-      let mid := (lo + hi) / 2
-      if edits[byStop[mid]!]!.range.stop ≤ e.range.start then lo := mid + 1 else hi := mid
-    prev := prev.push lo
-    best := best.push (max best[k]! (best[lo]! + saving e))
-  let mut out := #[]
-  let mut k := byStop.size
-  while k > 0 do
-    if best[k]! > best[k-1]! then
-      out := out.push byStop[k-1]!
-      k := prev[k-1]!
-    else k := k - 1
-  return out.reverse
+  return bestDisjoint byStop (edits[·]!.range.start.byteIdx) (edits[·]!.range.stop.byteIdx) (saving edits[·]!)
 
 private def applyTo (input : String) (r : Syntax.Range) (edits : Array Edit) : String := Id.run do
   let mut out := ""
@@ -111,7 +87,7 @@ def check (input : String) (map : FileMap) (cmd : Syntax) (pctx : Parser.ParserM
     let c := { ctx with fileMap := ictx.fileMap, cmdPos := 0 }
     let .ok ((), s) ← ((Command.elabCommandTopLevel next).run c |>.run probe).toIO' | return false
     if s.messages.hasErrors then return false
-    sameDecls before.env after.env s.env (group.any (edits[·]!.dropsInstances))
+    sameDecls before.env after.env s.env (group.any (dropsInstances edits[·]!))
   if ← works chosen then return chosen
   let mut accepted := #[]
   let mut todo := #[chosen]

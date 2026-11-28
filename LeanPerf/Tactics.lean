@@ -1,3 +1,4 @@
+import LeanPerf.Edit
 import LeanPerf.Blocks
 import LeanPerf.Steps
 import LeanPerf.Combine
@@ -37,18 +38,8 @@ namespace LeanPerf.Tactics
 
 open Replay (Run)
 
-structure Edit where
-  rule : String
-  message : String
-  range : Lsp.Range
-  newText : String
-  /-- The steps the edit takes out of its command, or 1000 for each declaration (`Steps.worth`). -/
-  gain : Nat := 0
-  deriving ToJson, FromJson, Inhabited
-
 /-- The leading identifier-like token of a tactic, e.g. `simp_all` or `nlinarith`. -/
-def head (text : String) : String :=
-  (text.takeWhile fun c => c.isAlphanum || c == '_' || c == '\'' || c == '?' || c == '!').toString
+def head (text : String) : String := Steps.head text
 
 /-- Text after the head token. -/
 def rest (text : String) : String := (text.drop (head text).length).toString
@@ -217,7 +208,7 @@ def tacticEdits (input : String) (map : FileMap) (tree : InfoTree) (minSaving : 
       edits := edits.push {
         rule := "fasterTactic"
         message := s!"{s.text.take 60} → {c.take 60}: {base / 1000} → {cost / 1000} heartbeats"
-        range := map.utf8RangeToLspRange s.range, newText := placeAt c (map.toPosition s.range.start).column }
+        range := s.range, newText := placeAt c (map.toPosition s.range.start).column }
   return edits
 
 /-- The optional `only` and bracketed arguments of a simplifier call. -/
@@ -298,8 +289,7 @@ def simpEdits (input : String) (map : FileMap) (tree : InfoTree) : IO (Array Edi
       text.contains '[') do
     if let some text ← shorterSimp? map s then
       edits := edits.push {
-        rule := "shorterSimp", message := "Shorten the simplifier arguments",
-        range := map.utf8RangeToLspRange s.range, newText := text }
+        rule := "shorterSimp", message := "Shorten the simplifier arguments", range := s.range, newText := text }
   return edits
 
 /-- `set_option o v in cmd` for an overridable `o`: the option and the inner command. -/
@@ -317,10 +307,6 @@ def declarationLike (input : String) (cmd : Syntax) : Bool := Id.run do
   let some r := cmd.getRange? | return false
   let head := String.Pos.Raw.extract input r.start ⟨min r.stop.byteIdx (r.start.byteIdx + 400)⟩
   return !["parser", "macro", "elab", "syntax", "notation"].any (head.contains ·)
-
-/-- Lints whose edits rest only on replaying a step, not on elaborating the whole command. -/
-def replayed : List String :=
-  ["fasterTactic", "reuseProof", "shorterBlock", "shorterSimp", "unneededStep", "contractPair"] ++ Lints.redundant
 
 /-- `seal f in cmd` or `unseal f in cmd`: the keyword and the inner command. -/
 def sealed? (cmd : Syntax) : Option (String × Syntax) := do
@@ -358,24 +344,90 @@ private def sameDecls (before a b : Environment) : Bool :=
   a.constants.map₂.toList.all fun (n, c) =>
     before.contains n || (b.find? n).any (·.type.equal c.type)
 
-/-- Rules whose edit can leave a proof with as many steps as before: an edit of theirs must take
-    steps out of its command. -/
-def stepGated : List String := ["reprove", "reuseProof", "termCompile"]
-
 /-- Whether `e`, applied alone, takes tactic steps out of the command `cmd`. An edit outside the
     command, or one after which the command does not parse alone, is kept: elaboration decides. -/
-def fewerSteps (input : String) (map : FileMap) (cmd : Syntax) (pctx : Parser.ParserModuleContext)
-    (fileName : String) (e : Edit) : Bool := Id.run do
+def fewerSteps (input : String) (cmd : Syntax) (pctx : Parser.ParserModuleContext) (fileName : String)
+    (e : Edit) : Bool := Id.run do
   let some r := cmd.getRange? (canonicalOnly := true) | return true
-  let er := map.lspRangeToUtf8Range e.range
-  unless r.start ≤ er.start && er.stop ≤ r.stop do return true
+  unless r.start ≤ e.range.start && e.range.stop ≤ r.stop do return true
   let kinds := Steps.tacticKinds pctx.env
-  let text := String.Pos.Raw.extract input r.start er.start ++ e.newText ++ String.Pos.Raw.extract input er.stop r.stop
+  let text := String.Pos.Raw.extract input r.start e.range.start ++ e.newText ++
+    String.Pos.Raw.extract input e.range.stop r.stop
   match Steps.ofCommand kinds text pctx fileName with
   | some n => decide (n < Steps.count kinds cmd)
   | none => true
 
+/-- An edit with the byte range of an LSP range of `map`. -/
+private def ofLsp (map : FileMap) (rule message : String) (e : Lsp.TextEdit) : Edit :=
+  { rule, message, range := map.lspRangeToUtf8Range e.range, newText := e.newText }
+
+/-- The theorem of `cmd` up to its proof, for a model that proposes contractions. -/
+private def statementOf (input : String) (cmd : Syntax) : String :=
+  match Signature.asTheorem? cmd, cmd.getPos? (canonicalOnly := true) with
+  | some thm, some p => match thm[1][3].getPos? (canonicalOnly := true) with
+    | some q => String.Pos.Raw.extract input p q ++ ":= by"
+    | none => ""
+  | _, _ => ""
+
+/-- What the lints that read one command at a time propose for it, in order. `on` says which run.
+    The lints that read info trees run on each tree in turn. -/
+private def commandEdits (on : String → Bool) (e : Elaborated) (minSaving : Nat) (shorter : Bool)
+    (instances : Option (Name → Bool)) : IO (Array Edit) := do
+  let { input, map, cmd, pctx, ctx, before, after, .. } := e
+  let mut out : Array Edit := #[]
+  if on "shorterSignature" then
+    if let some x ← Signature.compress input map cmd ctx before after then
+      out := out.push (ofLsp map "shorterSignature" "Shorten the theorem statement" x)
+  if on "reprove" then
+    if let some x ← Reprove.proof? input map cmd ctx before after then
+      out := out.push (ofLsp map "reprove" s!"Re-prove with {x.newText}" x)
+  if let some cited := instances then
+    for r in ← Instances.edits input map cmd pctx ctx before after cited do
+      out := out.push { rule := "unusedInstance", message := "Neither the statement nor the proof uses this instance",
+                        range := r, newText := "" }
+  let golf := Golf.rules.filter on
+  unless golf.isEmpty do out := out ++ (← Golf.edits input map cmd pctx ctx before after golf)
+  if on "unusedHave" then
+    if let some x ← Prune.proof? input map cmd pctx ctx before after then
+      out := out.push (ofLsp map "unusedHave" "Remove unused local proofs" x)
+  let redundant := Redundant.rules.filter on
+  for t in e.trees do
+    if on "fasterTactic" then out := out ++ (← tacticEdits input map t minSaving shorter)
+    if on "shorterSimp" then out := out ++ (← simpEdits input map t)
+    if on "contractPair" then
+      out := out ++ (← Blocks.contractPairs input map t (statement := statementOf input cmd) (spent := e.spent))
+    if on "unneededStep" then out := out ++ (← Blocks.unneededSteps input map t (spent := e.spent))
+    if on "shorterBlock" then out := out ++ (← Blocks.edits input map t (spent := e.spent))
+    unless redundant.isEmpty do out := out ++ (← Redundant.edits input map t redundant (spent := e.spent))
+  return out
+
+/-- What the lints that reread a command without its `set_option … in` or `seal … in` propose. -/
+private def overrideEdits (on : String → Bool) (e : Elaborated) : IO (Array Edit) := do
+  let { input, map, cmd, ctx, before, .. } := e
+  let mut out : Array Edit := #[]
+  if on "unneededOption" then
+    if let some (o, inner) := override? cmd then
+      let plain := { before with infoState := { enabled := false } }
+      let ok ← match ← ((Command.elabCommandTopLevel inner).run ctx |>.run plain).toIO' with
+        | .ok ((), s') => pure !s'.messages.hasErrors
+        | .error _ => pure false
+      if ok then
+        if let (some a, some b) := (cmd.getPos?, inner.getPos?) then
+          out := out.push { rule := "unneededOption", message := s!"`set_option {o}` is not needed here"
+                            range := ⟨a, b⟩, newText := "" }
+  if on "unneededSeal" then
+    if let some (kw, inner) := sealed? cmd then
+      -- A seal keeps definitional checks from unfolding a definition, so dropping it must
+      -- not make elaboration slower.
+      if let (some (a, sa), some (b, sb)) := (← cost cmd ctx before, ← cost inner ctx before) then
+        if b ≤ a && sameDecls before.env sa.env sb.env then
+          if let (some p, some q) := (cmd.getPos?, inner.getPos?) then
+            out := out.push { rule := "unneededSeal", message := s!"`{kw}` is not needed here: {a / 1000} → {b / 1000} heartbeats"
+                              range := ⟨commentAbove input map p, q⟩, newText := "" }
+  return out
+
 structure Result where
+  /-- Edits with byte ranges of the module's text. -/
   edits : Array Edit := #[]
   errors : Array String := #[]
   /-- The tactic steps (`Steps.count`) and declarations of the module as it was read. -/
@@ -383,14 +435,14 @@ structure Result where
   decls : Nat := 0
   deriving Inhabited
 
-/-- Elaborate `input` on top of `env` (its imports), collecting edits. -/
+/-- Elaborate `input` on top of `env` (its imports), collecting the edits of the lints that
+    `enabled` names. `compression` is the index of imported proofs for `reuseProof`, `instances` says
+    which instance arguments other modules cite for `unusedInstance`, `proposer` is the command of
+    `rewrite`, and `external` names the theorems that other modules mention. -/
 def analyze (env : Environment) (main : Name) (fileName input : String) (opts : Options)
-    (minSaving : Nat := 1000) (tactics options : Bool := true) (shorter := false)
-    (compression : Option ProofCompression.Index := none)
-    (signatures prune searchProofs := compression.isSome) (redundant : List String := [])
-    (instances : Option (Name → Bool) := none) (seals := false) (blocks := false) (steps := false) (layout := false)
-    (proposer : Option String := none) (external : Array String := #[]) (comments := false)
-    (golf : List String := []) (fold := false) (simpArgs := false) (pairs := false) : IO Result := do
+    (enabled : String → Bool) (minSaving : Nat := 1000) (shorter := false)
+    (compression : Option ProofCompression.Index := none) (instances : Option (Name → Bool) := none)
+    (proposer : Option String := none) (external : Array String := #[]) : IO Result := do
   let ictx := Parser.mkInputContext input fileName
   let (_, ps0, _) ← Parser.parseHeader ictx
   let mut s := Command.mkState (env.setMainModule main) {} opts
@@ -398,10 +450,12 @@ def analyze (env : Environment) (main : Name) (fileName input : String) (opts : 
   let mut res : Result := {}
   let mut localProofs : ProofCompression.Index := {}
   let mut records : Array Propose.Record := #[]
-  let needInfo := tactics || signatures || searchProofs || compression.isSome || !redundant.isEmpty || blocks || steps ||
-    simpArgs || pairs || golf.contains "shortNames" || golf.contains "obtainProjection"
+  let lints := Lints.catalog.filter (enabled ·.name)
+  let fold := enabled "foldHelper"
+  let needInfo := compression.isSome || lints.any (·.info)
   -- Joining lines needs only the parser state, which declarations do not change.
-  let parseOnly := (layout || comments) && !needInfo && !options && !seals && !prune && instances.isNone && proposer.isNone
+  let parseOnly := lints.any (·.group == "layout") && lints.all (·.group == "layout") &&
+    instances.isNone && proposer.isNone && compression.isNone
   repeat
     let scope := s.scopes.head!
     let pctx : Parser.ParserModuleContext :=
@@ -417,16 +471,14 @@ def analyze (env : Environment) (main : Name) (fileName input : String) (opts : 
                       decls := res.decls + (if Steps.isDeclaration cmd then 1 else 0) }
     let ctx : Command.Context :=
       { fileName, fileMap := ictx.fileMap, cmdPos := pos, snap? := none, cancelTk? := none }
-    if comments then
+    if enabled "stripComments" then
       for (rg, t) in Layout.stripComments input cmd pctx fileName do
         res := { res with edits := res.edits.push {
-          rule := "stripComments", message := "Delete this comment", newText := t
-          range := ictx.fileMap.utf8RangeToLspRange rg } }
-    if layout then
+          rule := "stripComments", message := "Delete this comment", newText := t, range := rg } }
+    if enabled "joinLines" then
       for j in Layout.joins input cmd pctx fileName do
         res := { res with edits := res.edits.push {
-          rule := "joinLines", message := "Join this line to the one above", newText := " "
-          range := ictx.fileMap.utf8RangeToLspRange j } }
+          rule := "joinLines", message := "Join this line to the one above", newText := " ", range := j } }
     if parseOnly && declarationLike input cmd then continue
     let before := { s with messages := {}, infoState := { enabled := needInfo } }
     let h0 ← IO.getNumHeartbeats
@@ -446,123 +498,36 @@ def analyze (env : Environment) (main : Name) (fileName input : String) (opts : 
           if m.severity == .error && res.errors.size < 5 && !parseOnly then
             res := { res with errors := res.errors.push s!"{m.pos.line}:{m.pos.column + 1}: {← m.data.toString}" }
       else
-        let mark := res.edits.size
-        if signatures then
-          if let some e ← Signature.compress input ictx.fileMap cmd ctx before after then
-            res := { res with edits := res.edits.push {
-              rule := "shorterSignature", message := "Shorten the theorem statement",
-              range := e.range, newText := e.newText } }
-        if searchProofs then
-          if let some e ← Reprove.proof? input ictx.fileMap cmd ctx before after then
-            res := { res with edits := res.edits.push {
-              rule := "reprove", message := s!"Re-prove with {e.newText}",
-              range := e.range, newText := e.newText } }
-        if let some cited := instances then
-          for r in ← Instances.edits input ictx.fileMap cmd pctx ctx before after cited do
-            res := { res with edits := res.edits.push {
-              rule := "unusedInstance", message := "Neither the statement nor the proof uses this instance",
-              range := ictx.fileMap.utf8RangeToLspRange r, newText := "" } }
-        unless golf.isEmpty do
-          for e in ← Golf.edits input ictx.fileMap cmd pctx ctx before after golf do
-            res := { res with edits := res.edits.push {
-              rule := e.rule, message := e.message,
-              range := ictx.fileMap.utf8RangeToLspRange e.range, newText := e.newText } }
-        if prune then
-          if let some e ← Prune.proof? input ictx.fileMap cmd pctx ctx before after then
-            res := { res with edits := res.edits.push {
-              rule := "unusedHave", message := "Remove unused local proofs",
-              range := e.range, newText := e.newText } }
-        if tactics || compression.isSome || !redundant.isEmpty || blocks || steps || simpArgs || pairs then
+        let el : Elaborated := { input, map := ictx.fileMap, fileName, cmd, pctx, ctx, before, after, spent
+                                 trees := after.infoState.trees.toArray.map (Replay.withEnv before.env) }
+        let mut mine ← commandEdits enabled el minSaving shorter instances
+        -- `reuseProof` also offers the theorems of the module proved so far.
+        if let some imports := compression then
           let mut names : NameSet := {}
-          for t in after.infoState.trees do
-            let t := Replay.withEnv before.env t
-            if tactics then
-              res := { res with edits := res.edits ++ (← tacticEdits input ictx.fileMap t minSaving shorter) }
-            if simpArgs then
-              res := { res with edits := res.edits ++ (← simpEdits input ictx.fileMap t) }
-            if pairs then
-              -- The theorem up to its proof, for a model that proposes contractions.
-              let statement := match Signature.asTheorem? cmd, cmd.getPos? (canonicalOnly := true) with
-                | some thm, some p => match thm[1][3].getPos? (canonicalOnly := true) with
-                  | some q => String.Pos.Raw.extract input p q ++ ":= by"
-                  | none => ""
-                | _, _ => ""
-              for e in ← Blocks.contractPairs input ictx.fileMap t (statement := statement) (spent := spent) do
-                res := { res with edits := res.edits.push {
-                  rule := "contractPair", message := e.message,
-                  range := ictx.fileMap.utf8RangeToLspRange e.range, newText := e.newText } }
-            if steps then
-              for e in ← Blocks.unneededSteps input ictx.fileMap t (spent := spent) do
-                res := { res with edits := res.edits.push {
-                  rule := "unneededStep", message := e.message,
-                  range := ictx.fileMap.utf8RangeToLspRange e.range, newText := e.newText } }
-            if blocks then
-              for e in ← Blocks.edits input ictx.fileMap t (spent := spent) do
-                res := { res with edits := res.edits.push {
-                  rule := "shorterBlock", message := e.message,
-                  range := ictx.fileMap.utf8RangeToLspRange e.range, newText := e.newText } }
-            for e in ← Redundant.edits input ictx.fileMap t redundant (spent := spent) do
-              res := { res with edits := res.edits.push {
-                rule := e.rule, message := e.message,
-                range := ictx.fileMap.utf8RangeToLspRange e.range, newText := e.newText } }
-          for t in after.infoState.trees do
-            if let some imports := compression then
-              let (edits, decls) ← ProofCompression.scan input ictx.fileMap (Replay.withEnv before.env t)
-                imports localProofs
-              names := names.merge decls
-              for e in edits do
-                res := { res with edits := res.edits.push {
-                  rule := "reuseProof", message := s!"Reuse {e.newText}",
-                  range := e.range, newText := e.newText } }
-          if compression.isSome then localProofs := ProofCompression.addDecls localProofs after.env names
-        if options then
-          if let some (o, inner) := override? cmd then
-            let plain := { before with infoState := { enabled := false } }
-            let ok ← match ← ((Command.elabCommandTopLevel inner).run ctx |>.run plain).toIO' with
-              | .ok ((), s') => pure !s'.messages.hasErrors
-              | .error _ => pure false
-            if ok then
-              if let (some a, some b) := (cmd.getPos?, inner.getPos?) then
-                res := { res with edits := res.edits.push {
-                  rule := "unneededOption", message := s!"`set_option {o}` is not needed here"
-                  range := ictx.fileMap.utf8RangeToLspRange ⟨a, b⟩, newText := "" } }
-        if seals then
-          if let some (kw, inner) := sealed? cmd then
-            -- A seal keeps definitional checks from unfolding a definition, so dropping it must
-            -- not make elaboration slower.
-            if let (some (a, sa), some (b, sb)) := (← cost cmd ctx before, ← cost inner ctx before) then
-              if b ≤ a && sameDecls before.env sa.env sb.env then
-                if let (some p, some q) := (cmd.getPos?, inner.getPos?) then
-                  res := { res with edits := res.edits.push {
-                    rule := "unneededSeal", message := s!"`{kw}` is not needed here: {a / 1000} → {b / 1000} heartbeats"
-                    range := ictx.fileMap.utf8RangeToLspRange ⟨commentAbove input ictx.fileMap p, q⟩, newText := "" } }
+          for t in el.trees do
+            let (edits, decls) ← ProofCompression.scan input ictx.fileMap t imports localProofs
+            names := names.merge decls
+            mine := mine ++ edits.map fun x => ofLsp ictx.fileMap "reuseProof" s!"Reuse {x.newText}" x
+          localProofs := ProofCompression.addDecls localProofs after.env names
+        mine := mine ++ (← overrideEdits enabled el)
+        -- Renaming touches every use of a name, so it waits until nothing else changes the command.
+        if mine.isEmpty && enabled "shortNames" then
+          mine := mine ++ (← Golf.checkedNames input ictx.fileMap cmd pctx ctx before after after.infoState.trees.toArray)
+        -- `--compress` takes steps out of proofs; a rewrite that may not, and does not, is left out.
+        mine := mine.map fun e => { e with gain := (Steps.removed input cmd pctx e.range e.newText).toNat }
+        mine := mine.filter fun e => !Lints.mustRemoveSteps.contains e.rule || fewerSteps input cmd pctx fileName e
         -- Edits that were each checked alone must also work together. An edit checked only by
         -- replaying its step is also checked in the command: the info tree can record a nested
         -- `by` block in a state the elaborator does not reach, as in a `calc` step.
-        -- Renaming touches every use of a name, so it waits until nothing else changes the command.
-        if res.edits.size == mark && golf.contains "shortNames" then
-          for e in ← Golf.checkedNames input ictx.fileMap cmd pctx ctx before after after.infoState.trees.toArray do
-            res := { res with edits := res.edits.push {
-              rule := e.rule, message := e.message,
-              range := ictx.fileMap.utf8RangeToLspRange e.range, newText := e.newText } }
-        -- `--compress` takes steps out of proofs; a rewrite that does not is left out.
-        let fresh := (res.edits.extract mark res.edits.size).map fun e =>
-          let d := Steps.removed input cmd pctx (ictx.fileMap.lspRangeToUtf8Range e.range) e.newText
-          { e with gain := d.toNat }
-        let fresh := fresh.filter fun e =>
-          !stepGated.contains e.rule || fewerSteps input ictx.fileMap cmd pctx fileName e
-        res := { res with edits := res.edits.extract 0 mark ++ fresh }
-        let mine := res.edits.extract mark res.edits.size
-        if mine.size > 1 || mine.any (replayed.contains ·.rule) then
-          let kept ← Combine.check input ictx.fileMap cmd pctx ctx before after (shorter := shorter) (trials := 15)
-            (mine.map fun e => { range := ictx.fileMap.lspRangeToUtf8Range e.range, newText := e.newText,
-                                 dropsInstances := e.rule == "unusedInstance", gain := e.gain })
-          res := { res with edits := res.edits.extract 0 mark ++ kept.map (mine[·]!) }
+        if mine.size > 1 || mine.any (Lints.replayed.contains ·.rule) then
+          let kept ← Combine.check input ictx.fileMap cmd pctx ctx before after (shorter := shorter) (trials := 15) mine
+          mine := kept.map (mine[·]!)
+        res := { res with edits := res.edits ++ mine }
       s := { after with infoState := { enabled := needInfo } }
   -- Helpers fold into their users once the whole module is elaborated. When a group fails, each
   -- of its helpers is tried alone, largest first; the next round can fold the rest.
-  if fold then
-    let debug := (← IO.getEnv "LEANPERF_GOLF_DEBUG").isSome
+  if enabled "foldHelper" then
+    let debug ← debugging "fold"
     for (a, b, keep, free) in Fold.groups records (Std.HashSet.ofArray external) do
       if free.isEmpty then continue
       let (some first, some last) := (records[a]?, records[b]?) | continue
@@ -590,15 +555,15 @@ def analyze (env : Environment) (main : Name) (fileName input : String) (opts : 
         match ← Propose.verify t first'.ctx first'.before last.after keep' (docs := true) (budget := some budget) with
         | none =>
           res := { res with edits := res.edits.push {
-            rule := "foldHelper", newText := t, range := ictx.fileMap.utf8RangeToLspRange rg
+            rule := "foldHelper", newText := t, range := rg
             gain := 1000 * fs.size
             message := s!"Fold {", ".intercalate (fs.toList.map fun n => s!"`{n}`")} into the theorem that uses it" } }
           break
         | some errs =>
           if debug then IO.eprintln s!"fold {fs.toList} rejected: {errs.toList.take 2}"
   -- A theorem that only applies another moves that one's proof into itself, and takes its place.
-  if fold then
-    let debug := (← IO.getEnv "LEANPERF_GOLF_DEBUG").isSome
+  if enabled "foldHelper" then
+    let debug ← debugging "fold"
     for (t, w, last, keep) in Fold.wrappers input records (Std.HashSet.ofArray external) do
       let (some first, some lastR) := (records[t]?, records[last]?) | continue
       let txt ← match Fold.mergeWrapper input records t w last with
@@ -611,7 +576,7 @@ def analyze (env : Environment) (main : Name) (fileName input : String) (opts : 
       match ← Propose.verify txt first.ctx first.before lastR.after keep (docs := true) (budget := some budget) with
       | none =>
         res := { res with edits := res.edits.push {
-          rule := "foldHelper", newText := txt, range := ictx.fileMap.utf8RangeToLspRange rg
+          rule := "foldHelper", newText := txt, range := rg
           gain := 1000
           message := s!"Move the proof of `{(Fold.nameAt records t).getD .anonymous}` into `{(Fold.nameAt records w).getD .anonymous}`, which only applies it" } }
       | some errs =>
@@ -633,23 +598,8 @@ def analyze (env : Environment) (main : Name) (fileName input : String) (opts : 
       if let some (rg, t, n) ← Propose.rewrite? input records a b keep free p (first? := first?) then
         let dropped := if free.isEmpty then "" else s!", with {free.size} helper lemma{if free.size == 1 then "" else "s"} it may fold in"
         res := { res with edits := res.edits.push {
-          rule := "rewrite", newText := t, range := ictx.fileMap.utf8RangeToLspRange rg
+          rule := "rewrite", newText := t, range := rg
           message := s!"Lean accepts the proposer's rewrite after {n} round{if n == 1 then "" else "s"}{dropped}" } }
   return res
-
-/-- Apply non-overlapping edits, later ones first. Returns the new text and how many applied. -/
-def applyEdits (text : String) (edits : Array Edit) : String × Nat := Id.run do
-  let map := FileMap.ofString text
-  let rs := edits.map fun e => (map.lspRangeToUtf8Range e.range, e.newText)
-  let rs := rs.qsort fun a b => a.1.start.byteIdx > b.1.start.byteIdx
-  let mut out := text
-  let mut limit := text.rawEndPos
-  let mut n := 0
-  for (r, t) in rs do
-    if r.stop.byteIdx > limit.byteIdx then continue
-    out := String.Pos.Raw.extract out 0 r.start ++ t ++ String.Pos.Raw.extract out r.stop out.rawEndPos
-    limit := r.start
-    n := n + 1
-  return (out, n)
 
 end LeanPerf.Tactics

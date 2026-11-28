@@ -1,3 +1,4 @@
+import LeanPerf.Edit
 import LeanPerf.Replay
 import LeanPerf.Steps
 import LeanPerf.Prune
@@ -20,11 +21,6 @@ Closers come in two kinds: automation such as `simp`, `grind` or `bound`, and `s
 open Lean Elab Meta
 
 namespace LeanPerf.Blocks
-
-structure Edit where
-  range : Syntax.Range
-  newText : String
-  message : String
 
 /-- Automation tried on every site, cheapest first. -/
 def closers : Array String :=
@@ -101,7 +97,6 @@ private def sequences (tree : InfoTree) : Array Syntax :=
     unless ti.stx.isOfKind ``Parser.Tactic.tacticSeq1Indented do return acc
     if acc.any (·.getRange? == ti.stx.getRange?) then acc else acc.push ti.stx
 
-private def uncommented (text : String) : Bool := !text.contains "--" && !text.contains "/-"
 
 /-- Whether the goal of a run is a proposition, so that any proof of it can take the place of
     another. -/
@@ -148,7 +143,7 @@ def edits (input : String) (map : FileMap) (tree : InfoTree) (perStep : Nat := 1
       let r : Syntax.Range := ⟨first, last⟩
       if taken.any fun t => t.start ≤ r.start && r.stop ≤ t.stop then break
       let text := String.Pos.Raw.extract input r.start r.stop
-      unless uncommented text do continue
+      unless Steps.uncommented text do continue
       let some sites := runs[key (tac.getRange? (canonicalOnly := true)).get!]? | continue
       let some sites := sites.mapM id | continue
       if sites.isEmpty then continue
@@ -206,7 +201,7 @@ def edits (input : String) (map : FileMap) (tree : InfoTree) (perStep : Nat := 1
           let lineStart := map.ofPosition { map.toPosition p with column := 0 }
           let width := (String.Pos.Raw.extract input lineStart p).length + 1 + c.length
           if kw == "by" && p != r.start && width ≤ 100 then return (p, " " ++ c) else return (r.start, c)
-        out := out.push { range := ⟨start, r.stop⟩, newText,
+        out := out.push { rule := "shorterBlock", range := ⟨start, r.stop⟩, newText,
                           message := s!"`{c}` closes the goal of these {had} steps: " ++
                             s!"{bases.foldl (· + ·) 0 / 1000} → {cost / 1000} heartbeats" }
         taken := taken.push r
@@ -252,13 +247,9 @@ def unneededSteps (input : String) (map : FileMap) (tree : InfoTree) (perByte : 
         unless run.goals.isEmpty do ok := false; break
       if ok then
         kept := kept.filter (· != i)
-        out := out.push { range := lines, newText := "",
+        out := out.push { rule := "unneededStep", range := lines, newText := "",
                           message := s!"The rest of the proof does without this step ({saved} bytes)" }
   return out
-
-/-- The leading word of a tactic's text, such as `simp_all` or `rw`. -/
-private def headWord (t : String) : String :=
-  (t.takeWhile fun c => c.isAlphanum || c == '_' || c == '\'' || c == '?' || c == '!').toString
 
 /-- The location of a `rw` or `simp` step written as text after its rules: `" at h ⊢"` or `""`. -/
 private def locationText (input : String) (stx : Syntax) : Option String := do
@@ -270,8 +261,8 @@ private def locationText (input : String) (stx : Syntax) : Option String := do
 /-- One step that may do the work of the adjacent steps `a` and `b` (their texts `ta`, `tb`): the steps' rules in one `rw` or `simp`, two `intro`s as one, `intro` then `exact` as a
     `fun`, `apply f` then `exact e` as `exact f e`. -/
 private def pairCandidates (input : String) (a b : Syntax) (ta tb : String) : Array String := Id.run do
-  let ha := headWord ta
-  let hb := headWord tb
+  let ha := Steps.head ta
+  let hb := Steps.head tb
   let rewriting := ["rw", "rewrite", "simp", "simp_rw", "dsimp", "simp_all", "norm_num"]
   let mut out := #[]
   -- Rules of rewriting steps at the same location, together.
@@ -347,7 +338,7 @@ def contractPairs (input : String) (map : FileMap) (tree : InfoTree) (perStep : 
     | some "" => pure none
     | some m => pure (some m)
     | none => defaultProposer
-  let debug := (← IO.getEnv "LEANPERF_PAIR_DEBUG").isSome
+  let debug ← debugging "pair"
   let trace (what : String) : IO Unit := do
     if debug then IO.eprintln s!"contractPair: {what}"; (← IO.getStderr).flush
   let mut out : Array Edit := #[]
@@ -391,7 +382,7 @@ def contractPairs (input : String) (map : FileMap) (tree : InfoTree) (perStep : 
       -- Both on one line each, without comments, the second on the line after the first.
       let span : Syntax.Range := ⟨ra.start, rb.stop⟩
       let between := String.Pos.Raw.extract input ra.stop rb.start
-      unless !ta.contains '\n' && !tb.contains '\n' && uncommented (String.Pos.Raw.extract input span.start span.stop) &&
+      unless !ta.contains '\n' && !tb.contains '\n' && Steps.uncommented (String.Pos.Raw.extract input span.start span.stop) &&
           between.trimAscii.isEmpty do
         i := i + 1; continue
       let kinds := Steps.tacticKinds s0.ci.env
@@ -456,7 +447,7 @@ def contractPairs (input : String) (map : FileMap) (tree : InfoTree) (perStep : 
       | none => i := i + 1
     for (_, t, r, changed, _) in cur do
       if changed then
-        out := out.push { range := r, newText := t,
+        out := out.push { rule := "contractPair", range := r, newText := t,
                           message := s!"One step does the work of these: {t}" }
   return out
 

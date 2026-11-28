@@ -1,5 +1,7 @@
+import LeanPerf.Edit
 import LeanPerf.Prune
 import LeanPerf.Replay
+import LeanPerf.Steps
 
 /-!
 # Redundant proof steps
@@ -22,12 +24,6 @@ open Lean Elab Meta
 
 namespace LeanPerf.Redundant
 
-structure Edit where
-  rule : String
-  message : String
-  range : Syntax.Range
-  newText : String
-
 private structure Site where
   rule : String
   message : String
@@ -39,8 +35,7 @@ private structure Site where
   single : Bool := false
 
 private def uncommented (input : String) (r : Syntax.Range) : Bool :=
-  let t := String.Pos.Raw.extract input r.start r.stop
-  !t.contains "--" && !t.contains "/-"
+  Steps.uncommented (String.Pos.Raw.extract input r.start r.stop)
 
 /-- The range of ` : T`, from the spaces before the colon of `spec` to the end of the type. A
     value written as a tactic block needs its type as the goal, so it is never a candidate. -/
@@ -196,6 +191,10 @@ private def sameUpToInstances (ci : ContextInfo) (a b : List (Expr × List Name)
     for ((x, xs), (y, ys)) in a.zip b do
       unless xs == ys && (← withReducibleAndInstances (isDefEqGuarded x y)) do return false
     return true
+
+/-- The lints that this module implements. -/
+def rules : List String :=
+  ["restatedType", "redundantShow", "unneededClassical", "unneededErasure", "redundantAscription"]
 
 /-- Checked deletions inside the tactic proofs of one info tree, for the selected `rules`. -/
 def edits (input : String) (map : FileMap) (tree : InfoTree) (rules : List String) (spent : Nat := 0) :

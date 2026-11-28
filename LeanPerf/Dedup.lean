@@ -796,30 +796,28 @@ private def worker (context : IO.Ref (Option Context)) (dir : FilePath) (query :
           return idx
         pure (some idx)
       else pure none
-    let r ← Tactics.analyze base job.mod job.source.toString input opts minSaving
-      (tactics := enabled "fasterTactic") (options := enabled "unneededOption") (seals := enabled "unneededSeal")
+    let layout := (req.getObjValAs? Bool "layout").toOption.getD false
+    let proposer := ((req.getObjValAs? String "propose").toOption.filter (!·.isEmpty)).filter fun _ => enabled "rewrite"
+    -- A lint runs in its own mode and when it is not skipped.
+    let on (name : String) := enabled name && match (Lints.find? name).map (·.group) with
+      | some "tactics" => true
+      | some "compress" => compress
+      | some "layout" => layout
+      | some "propose" => proposer.isSome
+      | _ => false
+    let r ← Tactics.analyze base job.mod job.source.toString input opts on minSaving
       (shorter := (req.getObjValAs? Bool "shorter").toOption.getD false)
-      (compression := compression)
-      (signatures := compress && enabled "shorterSignature") (prune := compress && enabled "unusedHave")
-      (searchProofs := compress && enabled "reprove")
-      (redundant := if compress then Lints.redundant.filter enabled else [])
-      (blocks := compress && enabled "shorterBlock") (steps := compress && enabled "unneededStep")
-      (simpArgs := compress && enabled "shorterSimp")
-      (pairs := compress && enabled "contractPair")
-      (layout := (req.getObjValAs? Bool "layout").toOption.getD false && enabled "joinLines")
-      (comments := (req.getObjValAs? Bool "layout").toOption.getD false && enabled "stripComments")
-      (golf := if compress then Golf.rules.filter enabled else [])
-      (fold := compress && enabled "foldHelper")
-      (proposer := ((req.getObjValAs? String "propose").toOption.filter (!·.isEmpty)).filter
-        fun _ => enabled "rewrite")
+      (compression := compression) (proposer := proposer)
       (external := (req.getObjValAs? (Array String) "external").toOption.getD #[])
       (instances := ← if compress && enabled "unusedInstance" then do
           let names ← cited
           pure (some fun n => names.contains (lastComponent n))
         else pure none)
+    let map := FileMap.ofString input
     let findings := r.edits.map fun e =>
-      { rule := e.rule, message := e.message, lemma := "", range := e.range
-        edit := some { range := e.range, newText := e.newText }, gain := e.gain : Finding }
+      let range := map.utf8RangeToLspRange e.range
+      { rule := e.rule, message := e.message, lemma := "", range, edit := some { range, newText := e.newText }
+        gain := e.gain : Finding }
     IO.FS.writeFile (dir / "result.json")
       (toJson ({ findings, elabErrors := r.errors.size, steps := some r.steps, decls := some r.decls } : Report)).compress
     for e in r.errors do IO.eprintln s!"{job.source}: {e}"

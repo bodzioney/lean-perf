@@ -14,6 +14,13 @@ open Lean
 
 namespace LeanPerf.Steps
 
+/-- The leading identifier-like token of a tactic's text, e.g. `simp_all` or `nlinarith`. -/
+def head (text : String) : String :=
+  (text.takeWhile fun c => c.isAlphanum || c == '_' || c == '\'' || c == '?' || c == '!').toString
+
+/-- Whether `text` has no comment, which an edit of it could lose. -/
+def uncommented (text : String) : Bool := !text.contains "--" && !text.contains "/-"
+
 /-- Tactic syntax kinds that arrange other tactics rather than act on a goal. -/
 def structural : List SyntaxNodeKind :=
   [``Parser.Tactic.tacticSeq, ``Parser.Tactic.tacticSeq1Indented, ``Parser.Tactic.tacticSeqBracketed,

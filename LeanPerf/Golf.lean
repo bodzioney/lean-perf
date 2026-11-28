@@ -25,13 +25,6 @@ open Lean Elab
 
 namespace LeanPerf.Golf
 
-structure Edit where
-  rule : String
-  message : String
-  range : Syntax.Range
-  newText : String
-  deriving Inhabited
-
 private def saving (e : Edit) : Int :=
   (e.range.stop.byteIdx - e.range.start.byteIdx : Int) - e.newText.utf8ByteSize
 
@@ -677,8 +670,7 @@ def checkedNames (input : String) (map : FileMap) (cmd : Syntax) (pctx : Parser.
   if groups.isEmpty then return #[]
   let works (gs : Array (String × Array Edit)) : IO Bool := do
     let es := gs.foldl (fun acc (_, es) => acc ++ es) #[]
-    let kept ← Combine.check input map cmd pctx ctx before after
-      (es.map fun e => { range := e.range, newText := e.newText }) (shorter := true) (trials := 1)
+    let kept ← Combine.check input map cmd pctx ctx before after es (shorter := true) (trials := 1)
     return kept.size == es.size
   let mut accepted := #[]
   let mut todo := #[groups]
@@ -702,7 +694,7 @@ def edits (input : String) (map : FileMap) (cmd : Syntax) (pctx : Parser.ParserM
     IO (Array Edit) := do
   let works (e : Edit) : IO Bool := do
     let gain := (Steps.removed input cmd pctx e.range e.newText).toNat
-    let kept ← Combine.check input map cmd pctx ctx before after #[{ range := e.range, newText := e.newText, gain }]
+    let kept ← Combine.check input map cmd pctx ctx before after #[{ e with gain }]
       (shorter := true) (trials := 1)
     return kept.size == 1
   let mut out := #[]
@@ -719,7 +711,7 @@ def edits (input : String) (map : FileMap) (cmd : Syntax) (pctx : Parser.ParserM
     (if rules.contains "haveToRefine" then (haveToRefine input map cmd).map (·.toList) else #[]) ++
     (if rules.contains "sharedHaveBinders" then (sharedHaveBinders input cmd).map ([·]) else #[])
   groups := groups.qsort fun a b => (a.head?.map saving |>.getD 0) > (b.head?.map saving |>.getD 0)
-  let debug := (← IO.getEnv "LEANPERF_GOLF_DEBUG").isSome
+  let debug ← debugging "golf"
   for g in groups do
     for e in g do
       if checks ≥ maxChecks then break
@@ -727,15 +719,14 @@ def edits (input : String) (map : FileMap) (cmd : Syntax) (pctx : Parser.ParserM
       checks := checks + 1
       let ok ← works e
       if debug then
-        IO.eprintln s!"golf {e.rule} {map.toPosition e.range.start} {if ok then "accepted" else "rejected"}: {(e.newText.trimAscii.toString.toList.reverse.take 120).reverse.asString}"
+        IO.eprintln s!"golf {e.rule} {map.toPosition e.range.start} {if ok then "accepted" else "rejected"}: {String.ofList (e.newText.trimAscii.toString.toList.reverse.take 120).reverse}"
       if ok then
         out := out.push e
         break
   let projs := (if rules.contains "shortProjection" then shortProjections input cmd else #[]).filter fun e =>
     !out.any fun o => o.range.start < e.range.stop && e.range.start < o.range.stop
   unless projs.isEmpty do
-    let kept ← Combine.check input map cmd pctx ctx before after
-      (projs.map fun e => { range := e.range, newText := e.newText }) (shorter := true) (trials := 5)
+    let kept ← Combine.check input map cmd pctx ctx before after projs (shorter := true) (trials := 5)
     out := out ++ kept.map (projs[·]!)
   return out
 

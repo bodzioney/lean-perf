@@ -4,6 +4,7 @@ import LeanPerf.SyntaxDedup
 import LeanPerf.Unused
 import LeanPerf.Project
 import LeanPerf.Steps
+import LeanPerf.Edit
 import Std.Sync.Channel
 import Std.Sync.Mutex
 
@@ -266,32 +267,13 @@ private structure SourceEdit where
 private def SourceEdit.saving (e : SourceEdit) : Int :=
   Steps.worth e.gain ((e.stop.byteIdx - e.start.byteIdx : Int) - e.text.utf8ByteSize)
 
-/-- Weighted interval scheduling. Combining disjoint edits inside a proof can be worth more than
-    replacing the entire proof. -/
-private def smallestSource (edits : Array SourceEdit) : Array SourceEdit := Id.run do
+/-- The disjoint edits worth the most together. Combining disjoint edits inside a proof can be worth
+    more than replacing the entire proof. -/
+private def smallestSource (edits : Array SourceEdit) : Array SourceEdit :=
   let sorted := (edits.filter (·.saving > 0)).qsort fun a b =>
     a.stop < b.stop || (a.stop == b.stop && (a.start < b.start || (a.start == b.start && a.text < b.text)))
-  let mut scores : Array Int := #[0]
-  let mut choices : Array (Option Nat) := #[]
-  for h : i in [:sorted.size] do
-    let e := sorted[i]
-    let mut lo := 0
-    let mut hi := i
-    while lo < hi do
-      let mid := (lo + hi) / 2
-      if sorted[mid]!.stop ≤ e.start then lo := mid + 1 else hi := mid
-    let saving := scores[lo]! + e.saving
-    let take := saving > scores.back!
-    choices := choices.push (if take then some lo else none)
-    scores := scores.push (max scores.back! saving)
-  let mut n := sorted.size
-  let mut selected := #[]
-  while n > 0 do
-    n := n - 1
-    if let some prev := choices[n]! then
-      selected := selected.push sorted[n]!
-      n := prev
-  return selected.reverse
+  (bestDisjoint (Array.range sorted.size) (sorted[·]!.start.byteIdx) (sorted[·]!.stop.byteIdx)
+    (sorted[·]!.saving)).map (sorted[·]!)
 
 def rewrite (text : String) (fs : Array Finding) (shorter := false) : String × Nat := Id.run do
   let map := FileMap.ofString text
