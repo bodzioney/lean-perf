@@ -955,7 +955,10 @@ def foldedHelpers : IO Unit := withFixture fun r => do
     "theorem useBaseFold (m : Nat) : 0 + m = m := by rw [baseFold]\n" ++
     "theorem baseIffFold {p : Prop} : p ↔ p := Iff.rfl\n" ++
     "theorem wrapIffFold {p : Prop} : p ↔ p := baseIffFold\n" ++
-    "theorem useIffFold (p : Prop) (h : p) : p := baseIffFold.mp h\n")
+    "theorem useIffFold (p : Prop) (h : p) : p := baseIffFold.mp h\n" ++
+    "theorem notedStep (a : Nat) : 0 + a = a := by\n  -- the addition reduces\n  simp\n" ++
+    "theorem notedUser (b : Nat) : 0 + b = b := notedStep b\n" ++
+    "theorem notedUser2 (b : Nat) : b = 0 + b := (notedUser b).symm\n")
   let o ← run #["--compress", "--rules", "foldHelper", "--apply", path.toString] r
   ok o; hasErr o "foldHelper:"
   let t ← IO.FS.readFile path
@@ -963,9 +966,12 @@ def foldedHelpers : IO Unit := withFixture fun r => do
       "x.val ≠ 0 := by\n  have h0 (x : FoldBox) (h : 0 < x.val) : x.val ≠ 0 := Nat.pos_iff_ne_zero.1 h\n  exact h0 x h\n",
       shared, "theorem wrapFold (n : Nat) : 0 + n = n := by simp\n", "rw [wrapFold]",
       -- A use with a field after the name moves to the wrapper too.
-      "theorem wrapIffFold {p : Prop} : p ↔ p := Iff.rfl\n", ":= wrapIffFold.mp h\n"] do
+      "theorem wrapIffFold {p : Prop} : p ↔ p := Iff.rfl\n", ":= wrapIffFold.mp h\n",
+      -- A comment in a proof moves with it.
+      "  -- the addition reduces\n"] do
     check (has t s) s!"missing {s.quote}\n{t}"
-  for s in ["theorem foldStep", "theorem FoldBox.valNe", "theorem baseFold", "theorem baseIffFold"] do
+  for s in ["theorem foldStep", "theorem FoldBox.valNe", "theorem baseFold", "theorem baseIffFold",
+      "theorem notedStep"] do
     check (!has t s) s!"{s} should be folded\n{t}"
   ok (← sh "lake" #["env", "lean", path.toString] r)
 

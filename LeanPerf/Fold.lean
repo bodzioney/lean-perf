@@ -40,7 +40,8 @@ private def shift (t : String) (n : Nat) : String :=
 private def column (map : FileMap) (p : String.Pos.Raw) : Nat := (map.toPosition p).column
 
 /-- Whether a helper can be a `have`: no attributes, universe parameters, `where` or
-    `termination_by`, and no comments after its name. The byte where its name ends. -/
+    `termination_by`, and no comments in its signature, whose binders the fold may rewrite. Comments
+    in its proof move with the proof. The byte where its name ends. -/
 private def foldable? (input : String) (cmd : Syntax) : Option String.Pos.Raw := do
   let thm ← Signature.asTheorem? cmd
   let d := thm[1]
@@ -52,9 +53,9 @@ private def foldable? (input : String) (cmd : Syntax) : Option String.Pos.Raw :=
   guard (val[2].getNumArgs == 0 || (range? val[2]).isNone)
   guard (val.getNumArgs < 4 || val[3].getNumArgs == 0)
   let idr ← range? declId
-  let cr ← range? cmd
-  let rest := String.Pos.Raw.extract input idr.stop cr.stop
-  guard (!rest.contains "--" && !rest.contains "/-")
+  let vr ← range? val
+  let sig := String.Pos.Raw.extract input idr.stop vr.start
+  guard (!sig.contains "--" && !sig.contains "/-")
   return idr.stop
 
 /-- Whether identifier `x` names `full`: by a suffix of its components that ends at its last one,
@@ -448,8 +449,8 @@ def mergeWrapper (input : String) (records : Array Propose.Record) (t w last : N
   let some tv := range? tthm[1][3][1] | throw "no proof"
   let some wv := range? wthm[1][3][1] | throw "no proof"
   let some tr := range? (cmdAt t) | throw "no range"
+  -- Comments in the proof move with it.
   let tproof := String.Pos.Raw.extract input tv.start tr.stop
-  if tproof.contains "--" || tproof.contains "/-" then throw "the proof has comments"
   let mut out := ""
   for j in [t:last+1] do
     if j == t then continue
