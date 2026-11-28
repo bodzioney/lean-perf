@@ -4,7 +4,8 @@ template's support is the number of examples it reproduces.
 
     python3 -I templates.py OUT.jsonl EXAMPLES.jsonl...
 
-EXAMPLES are {steps, merged} lines (pairs21.py, LEANPERF_PAIR_LOG). A template is found by
+EXAMPLES are {steps, merged} lines (pairs21.py, LEANPERF_PAIR_LOG), of two or three steps, the
+windows of the peephole pass `contractPair`. A template is found by
 anti-unification. The longest balanced token spans that the merged step copies from the steps become
 holes `$k`, which match any balanced span and must match the same text wherever they recur. The
 other identifiers and terms of the steps become wildcards `$_`. Tactic names and keywords stay
@@ -247,7 +248,7 @@ def main():
     for f in files:
         for line in open(f):
             e = json.loads(line)
-            if len(e.get("steps", [])) == 2 and e.get("merged"):
+            if len(e.get("steps", [])) in (2, 3) and e.get("merged"):
                 examples.append((e["steps"], e["merged"]))
     templates = {}
     origin = defaultdict(set)

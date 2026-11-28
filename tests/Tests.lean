@@ -1028,6 +1028,24 @@ def contractedPairs : IO Unit := withFixture fun r => do
   check (!has t "  exact h\n" && has t "  exact fun x y ↦ hq\n") t
   ok (← sh "lake" #["env", "lean", path.toString] r)
 
+/-- Where no two steps merge, three can: the peephole window grows to three steps, and a proposer
+    sees all of them. -/
+def contractedTriples : IO Unit := withFixture fun r => do
+  let path := r / "Fixture" / "Triples.lean"
+  IO.FS.writeFile path ("theorem three (a b : Nat) (h : a = b) : a + 0 = b := by\n" ++
+    "  have h' := h\n  rw [Nat.add_zero]\n  exact h'\n")
+  -- A proposer that only answers windows of three steps.
+  let script := r / "triples.sh"
+  IO.FS.writeFile script ("#!/bin/sh\npython3 -c 'import json,sys; r=json.load(sys.stdin); " ++
+    "print(json.dumps({\"candidates\": [\"omega\"] if len(r[\"steps\"]) == 3 else []}))'\n")
+  discard <| sh "chmod" #["+x", script.toString] r
+  let o ← run #["--compress", "--rules", "contractPair", "--apply", path.toString] r
+    (env := #[("LEANPERF_PAIR_MODEL", some script.toString)])
+  ok o; hasErr o "contractPair:"
+  let t ← IO.FS.readFile path
+  check (has t "a + 0 = b := by\n  omega\n") t
+  ok (← sh "lake" #["env", "lean", path.toString] r)
+
 /-- A proposer is any command; Lean decides which of its rewrites to keep. The first round has only
     unsound or failing candidates, and the second, sent their errors, a correct one. -/
 def proposedRewrites : IO Unit := withFixture fun r => do
@@ -1272,7 +1290,7 @@ def tests : List (String × IO Unit) := [
   ("maximum nonoverlapping savings", overlappingSavings), ("signature compression", signatureCompression),
   ("local relation chains", relationChains), ("prune unused local proofs", pruneHaves),
   ("search for an alternative proof", alternativeProof),
-  ("redundant proof steps", redundantSteps), ("simp erasures", simpErasures), ("shorter blocks", shorterBlocks), ("shorter simp", shorterSimp), ("unneeded steps", unneededSteps), ("redundant ascriptions", redundantAscriptions), ("joined lines", joinedLines), ("stripped comments", strippedComments), ("golf rules", golfRules), ("golf obtain projection", golfObtainProjection), ("golf term compile", golfTermCompile), ("golf tactic pairs", golfTacticPairs), ("folded helpers", foldedHelpers), ("wrapped suggestions", wrappedSuggestions), ("contracted pairs", contractedPairs), ("shortened names", shortenedNames), ("proposed rewrites", proposedRewrites), ("proposed groups", proposedGroups), ("lemma declarations", lemmaDeclarations),
+  ("redundant proof steps", redundantSteps), ("simp erasures", simpErasures), ("shorter blocks", shorterBlocks), ("shorter simp", shorterSimp), ("unneeded steps", unneededSteps), ("redundant ascriptions", redundantAscriptions), ("joined lines", joinedLines), ("stripped comments", strippedComments), ("golf rules", golfRules), ("golf obtain projection", golfObtainProjection), ("golf term compile", golfTermCompile), ("golf tactic pairs", golfTacticPairs), ("folded helpers", foldedHelpers), ("wrapped suggestions", wrappedSuggestions), ("contracted pairs", contractedPairs), ("contracted triples", contractedTriples), ("shortened names", shortenedNames), ("proposed rewrites", proposedRewrites), ("proposed groups", proposedGroups), ("lemma declarations", lemmaDeclarations),
   ("unused theorems", unusedTheorems), ("unused theorems for a root", rootedTheorems), ("unused theorems by namespace", unusedNamespaces), ("unused instance arguments", unusedInstances),
   ("type matching with dependent and unused arguments", matchingTypes), ("select named lints", lintSelection),
   ("permuted dependent statements", permutedStatements)]

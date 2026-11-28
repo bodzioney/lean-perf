@@ -292,15 +292,15 @@ private def goalText (map : FileMap) (r : Run) : IO String := do
       return toString (← ppGoal r.goal)
   catch _ => return ""
 
-/-- Candidates from the command `model` (see scripts/pair-local), given the theorem, the steps
-    before the pair, the goal where the pair starts and the pair; none when it fails. -/
-private def modelCandidates (model statement : String) (previous : Array String) (goal ta tb : String) :
-    IO (Array String) := do
+/-- Candidates from the command `model` (see scripts/pair-dict), given the theorem, the steps before
+    the window, the goal where the window starts and its steps; none when it fails. -/
+private def modelCandidates (model statement : String) (previous : Array String) (goal : String)
+    (steps : Array String) : IO (Array String) := do
   try
     let child ← IO.Process.spawn
       { cmd := "sh", args := #["-c", model], stdin := .piped, stdout := .piped, stderr := .null }
     let req := Json.mkObj [("statement", statement), ("previous", toJson previous), ("goal", goal),
-      ("first", ta), ("second", tb)]
+      ("steps", toJson steps), ("first", toJson (steps[0]?.getD "")), ("second", toJson (steps[1]?.getD ""))]
     let child ← do
       let (stdin, child) ← child.takeStdin
       stdin.putStr req.compress
@@ -321,13 +321,14 @@ private def defaultProposer : IO (Option String) := do
   unless ← script.pathExists do return none
   return some ("'" ++ script.toString.replace "'" "'\\''" ++ "'")
 
-/-- Adjacent steps that one step does the work of. In every tactic sequence that proves a
-    proposition, each pair of single-line steps is tried against `pairCandidates` and the proposer's
-    candidates. A candidate must have fewer steps than the pair (`Steps.count`), and is kept when the
-    sequence with it in place of the pair still closes every goal it closed, at most twice as slowly
-    plus `perStep` raw heartbeats for each step saved; of those, the cheapest. Any proof will do, so the goals
-    between steps may differ. After a contraction the pair before it is tried again, so a run of
-    steps can shrink to one. -/
+/-- A peephole pass: adjacent steps that one step does the work of. In every tactic sequence that
+    proves a proposition, a window of two single-line steps, and of three where two give nothing,
+    is tried against `pairCandidates` (for two) and the proposer's candidates, such as the dictionary
+    of learned rules. A candidate must have fewer steps than the window (`Steps.count`), and is kept
+    when the sequence with it in place of the window still closes every goal it closed, at most
+    twice as slowly plus `perStep` raw heartbeats for each step saved; of those, the cheapest. Any
+    proof will do, so the goals between steps may differ. After a contraction the window steps back
+    one, so a run of steps can shrink to one. -/
 def contractPairs (input : String) (map : FileMap) (tree : InfoTree) (perStep : Nat := 100000)
     (maxSteps : Nat := 24) (maxChecks : Nat := 40) (statement := "") (width := 100) (spent : Nat := 0) :
     IO (Array Edit) := do
@@ -376,75 +377,81 @@ def contractPairs (input : String) (map : FileMap) (tree : InfoTree) (perStep : 
     let mut i := 0
     let mut checks := 0
     while i + 1 < cur.size && checks < maxChecks do
-      let (a, ta, ra, _, ga) := cur[i]!
+      let (_, _, ra, _, ga) := cur[i]!
       let prefixChanged := (cur.extract 0 i).any (·.2.2.2.1)
-      let (b, tb, rb, _, _) := cur[i+1]!
-      -- Both on one line each, without comments, the second on the line after the first.
-      let span : Syntax.Range := ⟨ra.start, rb.stop⟩
-      let between := String.Pos.Raw.extract input ra.stop rb.start
-      unless !ta.contains '\n' && !tb.contains '\n' && Steps.uncommented (String.Pos.Raw.extract input span.start span.stop) &&
-          between.trimAscii.isEmpty do
-        i := i + 1; continue
       let kinds := Steps.tacticKinds s0.ci.env
-      let had := Steps.count kinds a + Steps.count kinds b
-      -- Of the candidates with fewer steps that work, the cheapest, then the shortest: `rwa [h]`
-      -- before `grind` when both close the goal.
-      let mut found : Option (Syntax × String × Nat) := none
-      let fixed := pairCandidates input a b ta tb
-      trace s!"  pair {ta.take 60} / {tb.take 60}"
-      let goal ← match model, ga with
-        | some _, some g => goalText map g
-        | _, _ => pure ""
-      let proposed ← match model with
-        | some m => modelCandidates m statement ((cur.extract 0 i).map (·.2.1)) goal ta tb
-        | none => pure #[]
-      let cands := (fixed ++ proposed.filter (!fixed.contains ·)).qsort (·.utf8ByteSize < ·.utf8ByteSize)
-      for c in cands do
-        if checks ≥ maxChecks then break
-        let .ok stx := Parser.runParserCategory s0.ci.env `tactic c "<leanperf>" | continue
-        let fewer := had - min had (Steps.count kinds stx)
-        if fewer == 0 then continue
-        -- The step stays on one line, within 100 columns.
-        if (map.toPosition span.start).column + c.length > width then continue
-        let stx := Replay.relocate span stx
-        checks := checks + 1
-        let candidate := build ((cur.extract 0 i).map (·.1) ++ #[stx] ++ (cur.extract (i + 2) cur.size).map (·.1))
-        let mut works := true
-        -- While the steps before the pair are the original ones, the goal recorded before the
-        -- pair is where a replay of the whole sequence gets to, so a candidate that fails from
-        -- there fails: only it and the steps after it are run. Most candidates fail.
-        trace s!"    candidate {c.take 80}"
-        if let some g := ga then
-          if !prefixChanged then
-            let rest := build (#[stx] ++ (cur.extract (i + 2) cur.size).map (·.1))
-            let budget := 2 * bases.foldl max 0 + perStep * fewer
-            match ← Replay.run g.ci map g.mctx g.goal rest budget with
-            | some run => unless run.goals.isEmpty do works := false
-            | none => works := false
-        unless works do continue
-        let mut cost := 0
-        for (s, base) in sites.zip bases do
-          let budget := 2 * base + perStep * fewer
-          let some run ← Replay.run s.ci map s.mctx s.goal candidate budget | works := false; break
-          unless run.goals.isEmpty do works := false; break
-          cost := cost + run.heartbeats
-        if works then
-          match found with
-          | some (_, b, k) =>
-            if cost < k || (cost == k && c.utf8ByteSize < b.utf8ByteSize) then found := some (stx, c, cost)
-          | none => found := some (stx, c, cost)
-      match found with
-      | some (stx, c, _) =>
-        -- Accepted contractions are training data for the model that proposes them.
-        if let some log ← IO.getEnv "LEANPERF_PAIR_LOG" then
-          let h ← IO.FS.Handle.mk log .append
-          h.putStrLn (Json.mkObj [("source", "leanperf"), ("statement", statement),
-            ("previous", toJson ((cur.extract 0 i).map (·.2.1))), ("goal", goal),
-            ("steps", toJson #[ta, tb]), ("merged", c)]).compress
-        cur := (cur.extract 0 i).push (stx, c, span, true, ga) ++ cur.extract (i + 2) cur.size
-        -- The step before may now merge with the new one.
-        if i > 0 then i := i - 1
-      | none => i := i + 1
+      let previous := (cur.extract 0 i).map (·.2.1)
+      -- A window of two steps, then of three where two give nothing.
+      let mut merged := false
+      for k in [2, 3] do
+        if merged || i + k > cur.size || checks ≥ maxChecks then break
+        let win := cur.extract i (i + k)
+        let texts := win.map (·.2.1)
+        let some (_, _, rb, _, _) := win.back? | break
+        -- Every step on one line, without comments, each on the line after the one before.
+        let span : Syntax.Range := ⟨ra.start, rb.stop⟩
+        let adjacent := (List.range (k - 1)).all fun j =>
+          (String.Pos.Raw.extract input win[j]!.2.2.1.stop win[j + 1]!.2.2.1.start).trimAscii.isEmpty
+        unless texts.all (!·.contains '\n') && adjacent &&
+            Steps.uncommented (String.Pos.Raw.extract input span.start span.stop) do break
+        let had := win.foldl (fun n w => n + Steps.count kinds w.1) 0
+        -- Of the candidates with fewer steps that work, the cheapest, then the shortest: `rwa [h]`
+        -- before `grind` when both close the goal.
+        let mut found : Option (Syntax × String × Nat) := none
+        let fixed := if k == 2 then pairCandidates input win[0]!.1 win[1]!.1 texts[0]! texts[1]! else #[]
+        trace s!"  window {" / ".intercalate (texts.toList.map fun t => (t.take 50).toString)}"
+        let goal ← match model, ga with
+          | some _, some g => goalText map g
+          | _, _ => pure ""
+        let proposed ← match model with
+          | some m => modelCandidates m statement previous goal texts
+          | none => pure #[]
+        let cands := (fixed ++ proposed.filter (!fixed.contains ·)).qsort (·.utf8ByteSize < ·.utf8ByteSize)
+        for c in cands do
+          if checks ≥ maxChecks then break
+          let .ok stx := Parser.runParserCategory s0.ci.env `tactic c "<leanperf>" | continue
+          let fewer := had - min had (Steps.count kinds stx)
+          if fewer == 0 then continue
+          -- The step stays on one line, within 100 columns.
+          if (map.toPosition span.start).column + c.length > width then continue
+          let stx := Replay.relocate span stx
+          checks := checks + 1
+          let after := (cur.extract (i + k) cur.size).map (·.1)
+          let candidate := build ((cur.extract 0 i).map (·.1) ++ #[stx] ++ after)
+          let mut works := true
+          -- While the steps before the window are the original ones, the goal recorded before it
+          -- is where a replay of the whole sequence gets to, so a candidate that fails from there
+          -- fails: only it and the steps after it are run. Most candidates fail.
+          trace s!"    candidate {c.take 80}"
+          if let some g := ga then
+            if !prefixChanged then
+              let budget := 2 * bases.foldl max 0 + perStep * fewer
+              match ← Replay.run g.ci map g.mctx g.goal (build (#[stx] ++ after)) budget with
+              | some run => unless run.goals.isEmpty do works := false
+              | none => works := false
+          unless works do continue
+          let mut cost := 0
+          for (s, base) in sites.zip bases do
+            let budget := 2 * base + perStep * fewer
+            let some run ← Replay.run s.ci map s.mctx s.goal candidate budget | works := false; break
+            unless run.goals.isEmpty do works := false; break
+            cost := cost + run.heartbeats
+          if works then
+            match found with
+            | some (_, b, k) =>
+              if cost < k || (cost == k && c.utf8ByteSize < b.utf8ByteSize) then found := some (stx, c, cost)
+            | none => found := some (stx, c, cost)
+        if let some (stx, c, _) := found then
+          -- Accepted contractions are training data for the dictionary and the model.
+          if let some log ← IO.getEnv "LEANPERF_PAIR_LOG" then
+            let h ← IO.FS.Handle.mk log .append
+            h.putStrLn (Json.mkObj [("source", "leanperf"), ("statement", statement),
+              ("previous", toJson previous), ("goal", goal), ("steps", toJson texts), ("merged", c)]).compress
+          cur := (cur.extract 0 i).push (stx, c, span, true, ga) ++ cur.extract (i + k) cur.size
+          merged := true
+      -- After a contraction the step before may merge with the new one.
+      if !merged then i := i + 1
+      else if i > 0 then i := i - 1
     for (_, t, r, changed, _) in cur do
       if changed then
         out := out.push { rule := "contractPair", range := r, newText := t,
