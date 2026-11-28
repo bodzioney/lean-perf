@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""Generate peephole rules from a Lean project: propose contractions for the windows of its modules,
+keep those that Lean accepts, and relearn the dictionary that `contractPair` proposes from.
+
+    scripts/ml/learn-rules [--codex CALLS] [--jobs N] [--work DIR] MODULE_OR_DIR...
+
+Run it from the Lean project's root, with its dependencies built.
+
+1. Windows: the two- and three-step windows of the modules (pairdump.py).
+2. Proposals: the current dictionary, the local model when one serves (scripts/pair-local), and with
+   --codex, Codex on CALLS batches of 40 windows (pair-batch.py).
+3. Checks: `leanperf --stage cut,compress --rules contractPair` tries every proposal in preview, and
+   logs each contraction that Lean accepts. Nothing in the project changes.
+4. Rules: the accepted contractions join data/rule-examples.jsonl, and templates.py relearns
+   data/contractions.jsonl from all the examples.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(os.path.dirname(HERE))
+EXAMPLES = os.path.join(ROOT, "data", "rule-examples.jsonl")
+RULES = os.path.join(ROOT, "data", "contractions.jsonl")
+
+
+def lean_files(paths):
+    out = []
+    for p in paths:
+        if os.path.isdir(p):
+            for d, _, fs in os.walk(p):
+                out += [os.path.join(d, f) for f in sorted(fs) if f.endswith(".lean")]
+        else:
+            out.append(p)
+    return out
+
+
+def lines(path):
+    return sum(1 for _ in open(path)) if os.path.exists(path) else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("paths", nargs="+")
+    ap.add_argument("--codex", type=int, default=0, help="Codex calls of 40 windows each (default: none)")
+    ap.add_argument("--jobs", type=int, default=2)
+    ap.add_argument("--work", help="where to keep the windows, proposals and log (default: a new directory)")
+    a = ap.parse_args()
+    work = a.work or tempfile.mkdtemp(prefix="learn-rules-")
+    os.makedirs(work, exist_ok=True)
+    files = lean_files(a.paths)
+    windows = os.path.join(work, "windows.jsonl")
+    subprocess.run([sys.executable, "-I", os.path.join(HERE, "pairdump.py"), windows] + files, check=True)
+    env = dict(os.environ, LEANPERF_PAIR_MODEL=os.path.join(ROOT, "scripts", "pair-dict"),
+               LEANPERF_PAIR_LOG=os.path.join(work, "accepted.jsonl"))
+    if a.codex:
+        table = os.path.join(work, "table.jsonl")
+        subprocess.run([sys.executable, "-I", os.path.join(HERE, "pair-batch.py"), windows, table, "40",
+                        str(a.codex)], check=True)
+        env.update(LEANPERF_PAIR_NEXT=os.path.join(ROOT, "scripts", "pair-table"), LEANPERF_PAIR_TABLE=table)
+    leanperf = os.environ.get("LEANPERF", os.path.join(ROOT, ".lake", "build", "bin", "leanperf"))
+    r = subprocess.run([leanperf, "--stage", "cut,compress", "--rules", "contractPair", "--jobs", str(a.jobs)]
+                       + files, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    summary = [l for l in r.stderr.splitlines() if l.endswith("failed files")]
+    print(f"checks: {summary[-1] if summary else r.stderr.strip()[-300:]}")
+    # The accepted contractions join the examples, once each.
+    known = set()
+    for l in open(EXAMPLES):
+        e = json.loads(l)
+        known.add((tuple(e["steps"]), e["merged"]))
+    added = 0
+    accepted = os.path.join(work, "accepted.jsonl")
+    with open(EXAMPLES, "a") as f:
+        for l in (open(accepted) if os.path.exists(accepted) else []):
+            e = json.loads(l)
+            key = (tuple(e["steps"]), e["merged"])
+            if key in known:
+                continue
+            known.add(key)
+            f.write(json.dumps({"steps": e["steps"], "merged": e["merged"], "source": "learn-rules"},
+                               ensure_ascii=False) + "\n")
+            added += 1
+    before = lines(RULES)
+    subprocess.run([sys.executable, "-I", os.path.join(HERE, "templates.py"), RULES, EXAMPLES], check=True)
+    print(f"{lines(windows)} windows, {lines(accepted)} contractions accepted, {added} new examples; "
+          f"rules {before} -> {lines(RULES)}; work in {work}")
+
+
+if __name__ == "__main__":
+    main()

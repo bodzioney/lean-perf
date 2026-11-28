@@ -322,6 +322,17 @@ have := $0 / positivity           ->  positivity [$0]        (8)
 
 It proposes for 40% of the Riemann project's adjacent steps, about 2 ms per pair. Every contraction that Lean accepts can go back into the dictionary and the model's data, so both grow as they are used.
 
+### Generating rules
+
+`contractPair` is a peephole pass. It slides a window of two steps, and of three where two give nothing, along each tactic sequence, and replaces the window with one step when a rule or proposer finds one that Lean accepts. Like a peephole superoptimizer, it does the expensive search once, offline, and keeps what it finds as rules. `data/rule-examples.jsonl` holds every contraction checked so far, mined from repository history or accepted by Lean in a project, and `data/contractions.jsonl` is the dictionary learned from them. `scripts/ml/learn-rules MODULE_OR_DIR…`, run from a Lean project's root, grows both:
+
+1. It lists the windows of the modules (`scripts/ml/pairdump.py`).
+2. The current rules propose for them, then the local model when one serves, and with `--codex CALLS`, Codex on batches of 40 windows.
+3. `leanperf --stage cut,compress --rules contractPair` tries every proposal in preview and logs the contractions that Lean accepts. Nothing in the project changes.
+4. The new contractions join the examples, and `scripts/ml/templates.py` relearns the dictionary from all of them.
+
+A rerun of the same modules proposes from the new rules: a module's cached report is keyed by its proposer, the `LEANPERF_PAIR_*` settings and the contents of the rules and tables they read.
+
 ## Editor integration
 
 Start `/absolute/path/to/lean-perf/.lake/build/bin/leanperf --lsp` as an additional language server for Lean files. The server accepts full-document changes over stdio and publishes diagnostics for the current buffer version. The editor can request an individual quick fix or `source.fixAll.leanPerf` for the document. Edits use UTF-16 positions and include the document version when the client supports versioned workspace edits.

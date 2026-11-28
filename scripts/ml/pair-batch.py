@@ -2,8 +2,8 @@
 
     python3 -I pair-batch.py PAIRS.jsonl TABLE.jsonl [BATCH] [MAX_CALLS]
 
-PAIRS comes from pairdump.py. Each call sends BATCH numbered pairs (default 40) and asks for one step
-per pair, or SKIP; the answers go to TABLE as {steps, candidates}. Lean checks them later, with
+PAIRS comes from pairdump.py: windows of two or three steps. Each call sends BATCH numbered windows
+(default 40) and asks for one step per window, or SKIP; the answers go to TABLE as {steps, candidates}. Lean checks them later, with
 `LEANPERF_PAIR_MODEL=scripts/pair-table leanperf --compress --rules contractPair`. Pairs already in
 TABLE are skipped, so the script can resume; it stops after MAX_CALLS calls (default 50) or when a
 call fails.
@@ -19,9 +19,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pairprompt  # noqa: E402
 
 PROMPT = """You shorten Lean 4 (Mathlib) tactic proofs. Below are numbered items. Each gives a theorem
-statement, the proof steps before, and two consecutive tactic steps. For each item, propose ONE tactic
-step that does the work of both steps (it may close the goal or leave the same goal for the remaining
-proof), strictly shorter in characters than the two together. Use any Mathlib tactic or lemma.
+statement, the proof steps before, and two or three consecutive tactic steps. For each item, propose ONE
+tactic step that does the work of all of them (it may close the goal or leave the same goal for the
+remaining proof). Use any Mathlib tactic or lemma.
 
 The step must merge the work, as in these examples:
   rw [h] at h'  /  exact h'                       ->  rwa [h] at h'
@@ -29,7 +29,7 @@ The step must merge the work, as in these examples:
   apply f  /  exact h                             ->  exact f h
   rw [a]  /  exact h                              ->  exact a ▸ h
   obtain ⟨x, hx⟩ := h  /  exact ⟨x, hx.le⟩        ->  exact ⟨_, h.2.le⟩
-Do not join the two steps with `<;>` or `;`, and do not only reformat them, rename locals or drop type
+Do not join the steps with `<;>` or `;`, and do not only reformat them, rename locals or drop type
 ascriptions: other tools already do that. Most pairs cannot be merged; answer SKIP for those. Answer
 only with lines `<number>: <step>` or `<number>: SKIP`, one per item, in order, nothing else.
 """

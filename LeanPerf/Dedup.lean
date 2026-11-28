@@ -949,8 +949,19 @@ private unsafe def answer (slot : Build.Slot) (w : Workspace) (m : Name) (req : 
   let compress := (req.getObjValAs? Bool "compress").toOption.getD false
   let layout := (req.getObjValAs? Bool "layout").toOption.getD false
   let propose := (req.getObjValAs? String "propose").toOption.getD ""
+  -- The step contractions depend on their proposer: its command and the rules and tables it reads.
+  let pairs ← if !compress then pure "" else do
+    let vars := ["LEANPERF_PAIR_MODEL", "LEANPERF_PAIR_NEXT", "LEANPERF_PAIR_DICT", "LEANPERF_PAIR_TABLE",
+      "LEANPERF_PAIR_URL", "LEANPERF_PAIR_DICT_N", "LEANPERF_PAIR_DICT_MIN"]
+    let values : List (Option String) ← vars.mapM fun v => (IO.getEnv v : IO (Option String))
+    let checkout := (← IO.appPath).parent >>= (·.parent) >>= (·.parent) >>= (·.parent)
+    let files : List String := values.filterMap id ++
+      (checkout.map fun r => [(r / "data" / "contractions.jsonl").toString]).getD []
+    let contents ← files.mapM fun (f : String) => do
+      if f.endsWith ".jsonl" && (← System.FilePath.pathExists f) then return hash (← IO.FS.readFile f) else return (0 : UInt64)
+    pure s!"-pairs{hash (values, contents)}"
   let tacticReport := w.cache / "tactics" /
-    s!"{job.dir.fileName.get!}-{minSaving}-{shorter}-{compress}{if layout then "-layout" else ""}{if propose.isEmpty then "" else s!"-propose{hash propose}"}.json"
+    s!"{job.dir.fileName.get!}-{minSaving}-{shorter}-{compress}{if layout then "-layout" else ""}{if propose.isEmpty then "" else s!"-propose{hash propose}"}{pairs}.json"
   let cacheTactics := tactics && !checking && saved
   if cacheTactics && (← tacticReport.pathExists) then return ← Build.readJson tacticReport
   if saved && !raw && (← resultFile.pathExists) then

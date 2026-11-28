@@ -1,9 +1,10 @@
-"""List adjacent one-line tactic steps of Lean files, for a proposer that answers them in batches.
+"""List windows of two and three adjacent one-line tactic steps of Lean files, the windows of the
+peephole pass `contractPair`, for a proposer that answers them in batches.
 
     python3 -I pairdump.py OUT.jsonl FILE.lean...
 
 Each line of OUT is {path, statement, previous, steps}: the declaration up to its proof, up to six
-steps before the pair, and the two steps, as `contractPair` sends them to LEANPERF_PAIR_MODEL. The
+steps before the window, and its steps, as `contractPair` sends them to LEANPERF_PAIR_MODEL. The
 text is read with the indentation rules of pairs21.py, not parsed: Lean checks every answer later.
 """
 import json
@@ -33,21 +34,24 @@ def pairs(path, text):
         if start is not None:
             statement = "\n".join(decl[:start]).strip()
             for i in range(start, len(decl) - 1):
-                x, y = decl[i], decl[i + 1]
-                col = pairs21.indent(x)
-                if col < 2 or pairs21.indent(y) != col or not (pairs21.plain(x) and pairs21.plain(y)):
-                    continue
-                # A tactic step starts with its name; other lines continue a term.
-                if not (re.match(r"[a-z]", x.strip()) and re.match(r"[a-z]", y.strip())):
-                    continue
-                if i + 2 < len(decl) and decl[i + 2].strip() and pairs21.indent(decl[i + 2]) > col:
-                    continue
+                col = pairs21.indent(decl[i])
                 if i > start and pairs21.indent(decl[i - 1]) > col and decl[i - 1].strip():
-                    # `x` may continue the line above.
+                    # The first step may continue the line above.
                     continue
-                previous = [l.strip() for l in decl[start:i] if pairs21.indent(l) >= col and l.strip()][-6:]
-                yield {"path": path, "statement": statement, "previous": previous,
-                       "steps": [x.strip(), y.strip()]}
+                for k in (2, 3):
+                    win = decl[i:i + k]
+                    if len(win) < k or col < 2:
+                        break
+                    # A tactic step starts with its name, on one line; other lines continue a term.
+                    if not all(pairs21.indent(l) == col and pairs21.plain(l) and re.match(r"[a-z]", l.strip())
+                               for l in win):
+                        break
+                    if i + k < len(decl) and decl[i + k].strip() and pairs21.indent(decl[i + k]) > col:
+                        # The last step continues on the next line.
+                        break
+                    previous = [l.strip() for l in decl[start:i] if pairs21.indent(l) >= col and l.strip()][-6:]
+                    yield {"path": path, "statement": statement, "previous": previous,
+                           "steps": [l.strip() for l in win]}
         k = end
 
 
@@ -59,7 +63,7 @@ def main():
             for e in pairs(p, open(p, encoding="utf-8").read()):
                 f.write(json.dumps(e) + "\n")
                 n += 1
-    print(f"{n} pairs")
+    print(f"{n} windows")
 
 
 if __name__ == "__main__":
