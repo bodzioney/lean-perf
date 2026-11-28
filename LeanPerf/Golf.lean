@@ -701,7 +701,8 @@ def edits (input : String) (map : FileMap) (cmd : Syntax) (pctx : Parser.ParserM
     (ctx : Command.Context) (before after : Command.State) (rules : List String) (maxChecks := 12) :
     IO (Array Edit) := do
   let works (e : Edit) : IO Bool := do
-    let kept ← Combine.check input map cmd pctx ctx before after #[{ range := e.range, newText := e.newText }]
+    let gain := (Steps.removed input cmd pctx e.range e.newText).toNat
+    let kept ← Combine.check input map cmd pctx ctx before after #[{ range := e.range, newText := e.newText, gain }]
       (shorter := true) (trials := 1)
     return kept.size == 1
   let mut out := #[]

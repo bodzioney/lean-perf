@@ -641,6 +641,8 @@ structure Finding where
   lemma : String
   range : Lsp.Range
   edit : Option Lsp.TextEdit
+  /-- The steps the edit takes out, or 1000 for each declaration (`Steps.worth`). -/
+  gain : Nat := 0
   deriving ToJson, FromJson
 
 structure Report where
@@ -817,7 +819,7 @@ private def worker (context : IO.Ref (Option Context)) (dir : FilePath) (query :
         else pure none)
     let findings := r.edits.map fun e =>
       { rule := e.rule, message := e.message, lemma := "", range := e.range
-        edit := some { range := e.range, newText := e.newText } : Finding }
+        edit := some { range := e.range, newText := e.newText }, gain := e.gain : Finding }
     IO.FS.writeFile (dir / "result.json")
       (toJson ({ findings, elabErrors := r.errors.size, steps := some r.steps, decls := some r.decls } : Report)).compress
     for e in r.errors do IO.eprintln s!"{job.source}: {e}"

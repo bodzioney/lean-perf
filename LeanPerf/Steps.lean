@@ -47,4 +47,24 @@ def ofCommand (kinds : Parser.SyntaxNodeKindSet) (text : String) (pctx : Parser.
   let (eof, _, msgs) := Parser.parseCommand ictx pctx ps msgs
   if msgs.hasErrors || !Parser.isTerminalCommand eof then none else some (count kinds stx)
 
+/-- How many steps the command `cmd` loses when `newText` replaces `range` of `input`; 0 when the
+    edit reaches outside the command or the result does not parse alone, and negative when it
+    gains steps. -/
+def removed (input : String) (cmd : Syntax) (pctx : Parser.ParserModuleContext) (range : Syntax.Range)
+    (newText : String) : Int :=
+  match cmd.getRange? (canonicalOnly := true) with
+  | none => 0
+  | some r =>
+    if range.start < r.start || r.stop < range.stop then 0 else
+      let kinds := tacticKinds pctx.env
+      let text := String.Pos.Raw.extract input r.start range.start ++ newText ++
+        String.Pos.Raw.extract input range.stop r.stop
+      match ofCommand kinds text pctx "<leanperf>" with
+      | some n => (count kinds cmd : Int) - n
+      | none => 0
+
+/-- What an edit is worth: each declaration it removes outranks any number of steps, each step any
+    number of bytes. An edit is worth making when this is positive. -/
+def worth (gain : Nat) (bytesSaved : Int) : Int := (gain : Int) * 1000000 + bytesSaved
+
 end LeanPerf.Steps

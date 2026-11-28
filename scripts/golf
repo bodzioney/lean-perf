@@ -1,5 +1,5 @@
 #!/bin/sh
 # Every shrinking pass of LeanPerf, in order: `leanperf --golf`, which takes the same options:
-#   --cosmetic --strip-comments --keep-unused --no-optimize --rounds N --jobs N
+#   --cosmetic --strip-comments --keep-unused --no-optimize --speed --rounds N --jobs N
 # Run it from the project's root, on a clean tree. LEANPERF names another build of leanperf.
 exec "${LEANPERF:-$(dirname "$0")/../.lake/build/bin/leanperf}" --golf "$@"

@@ -621,8 +621,9 @@ def pruneHaves : IO Unit := withFixture fun r => do
     "  have unnecessary : True := by\n    exact True.intro\n" ++
     "  have annotated : True := by /- keep this explanation -/ trivial\n" ++
     "  apply solve\n  first | assumption | sorry\n")
-  -- `unneededStep` deletes the same line; this test is about `unusedHave`.
-  let o ← run #["--compress", "-A", "unneededStep", "--apply", path.toString] r
+  -- `unneededStep` deletes the same line, and `termCompile` with `shorterBlock` take out more steps
+  -- than the deletion; this test is about `unusedHave`.
+  let o ← run #["--compress", "-A", "unneededStep,termCompile,shorterBlock", "--apply", path.toString] r
   ok o; hasErr o "unusedHave"
   let text ← IO.FS.readFile path
   check (!has text "unnecessary" && has text "have needed" && has text "have annotated") text
@@ -986,12 +987,15 @@ def contractedPairs : IO Unit := withFixture fun r => do
   let kept := "theorem kept (a b : Nat) (h : a = b) : b = a := by\n  subst h\n  rfl\n"
   IO.FS.writeFile path ("theorem rws (a b : Nat) (h : a = b) : 0 + a + 0 = b := by\n" ++
     "  rw [Nat.add_zero]\n  rw [Nat.zero_add]\n  exact h\n" ++
-    "theorem intros (p q : Prop) (hq : q) : p → p → q := by\n  intro x\n  intro y\n  exact hq\n" ++ kept)
+    "theorem intros (p q : Prop) (hq : q) : p → p → q := by\n  intro x\n  intro y\n  exact hq\n" ++
+    "theorem single (p q : Prop) (hq : q) : p → q := by\n  intro x\n  exact hq\n" ++ kept)
   let o ← run #["--compress", "--rules", "contractPair", "--apply", path.toString] r
   ok o; hasErr o "contractPair:"
   let t ← IO.FS.readFile path
   -- One step in place of two, though `exact fun x y ↦ hq` takes more bytes than its two steps.
-  for s in ["  rw [Nat.add_zero, Nat.zero_add]\n  exact h\n", "  exact fun x y ↦ hq\n", kept] do
+  -- `exact fun x ↦ hq` takes as many bytes as `intro x` and `exact hq`, and one step fewer.
+  for s in ["  rw [Nat.add_zero, Nat.zero_add]\n  exact h\n", "  exact fun x y ↦ hq\n",
+      "p → q := by\n  exact fun x ↦ hq\n", kept] do
     check (has t s) s!"missing {s.quote}\n{t}"
   ok (← sh "lake" #["env", "lean", path.toString] r)
   -- The dictionary that comes with LeanPerf, used when no proposer is named, goes on: it knows

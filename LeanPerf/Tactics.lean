@@ -42,6 +42,8 @@ structure Edit where
   message : String
   range : Lsp.Range
   newText : String
+  /-- The steps the edit takes out of its command, or 1000 for each declaration (`Steps.worth`). -/
+  gain : Nat := 0
   deriving ToJson, FromJson, Inhabited
 
 /-- The leading identifier-like token of a tactic, e.g. `simp_all` or `nlinarith`. -/
@@ -533,14 +535,17 @@ def analyze (env : Environment) (main : Name) (fileName input : String) (opts : 
               rule := e.rule, message := e.message,
               range := ictx.fileMap.utf8RangeToLspRange e.range, newText := e.newText } }
         -- `--compress` takes steps out of proofs; a rewrite that does not is left out.
-        let fresh := (res.edits.extract mark res.edits.size).filter fun e =>
+        let fresh := (res.edits.extract mark res.edits.size).map fun e =>
+          let d := Steps.removed input cmd pctx (ictx.fileMap.lspRangeToUtf8Range e.range) e.newText
+          { e with gain := d.toNat }
+        let fresh := fresh.filter fun e =>
           !stepGated.contains e.rule || fewerSteps input ictx.fileMap cmd pctx fileName e
         res := { res with edits := res.edits.extract 0 mark ++ fresh }
         let mine := res.edits.extract mark res.edits.size
         if mine.size > 1 || mine.any (replayed.contains ·.rule) then
           let kept ← Combine.check input ictx.fileMap cmd pctx ctx before after (shorter := shorter) (trials := 15)
             (mine.map fun e => { range := ictx.fileMap.lspRangeToUtf8Range e.range, newText := e.newText,
-                                 dropsInstances := e.rule == "unusedInstance" })
+                                 dropsInstances := e.rule == "unusedInstance", gain := e.gain })
           res := { res with edits := res.edits.extract 0 mark ++ kept.map (mine[·]!) }
       s := { after with infoState := { enabled := needInfo } }
   -- Helpers fold into their users once the whole module is elaborated. When a group fails, each
@@ -575,6 +580,7 @@ def analyze (env : Environment) (main : Name) (fileName input : String) (opts : 
         | none =>
           res := { res with edits := res.edits.push {
             rule := "foldHelper", newText := t, range := ictx.fileMap.utf8RangeToLspRange rg
+            gain := 1000 * fs.size
             message := s!"Fold {", ".intercalate (fs.toList.map fun n => s!"`{n}`")} into the theorem that uses it" } }
           break
         | some errs =>
@@ -595,6 +601,7 @@ def analyze (env : Environment) (main : Name) (fileName input : String) (opts : 
       | none =>
         res := { res with edits := res.edits.push {
           rule := "foldHelper", newText := txt, range := ictx.fileMap.utf8RangeToLspRange rg
+          gain := 1000
           message := s!"Move the proof of `{(Fold.nameAt records t).getD .anonymous}` into `{(Fold.nameAt records w).getD .anonymous}`, which only applies it" } }
       | some errs =>
         if debug then IO.eprintln s!"merge wrapper {t} {w} rejected: {errs.toList.take 2}"

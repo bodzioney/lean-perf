@@ -3,6 +3,7 @@ import LeanPerf.Lints
 import LeanPerf.SyntaxDedup
 import LeanPerf.Unused
 import LeanPerf.Project
+import LeanPerf.Steps
 import Std.Sync.Channel
 import Std.Sync.Mutex
 
@@ -40,6 +41,8 @@ structure Finding where
   «lemma» : Option String := none
   range : Option Lsp.Range := none
   edit : Option Lsp.TextEdit := none
+  /-- The steps the edit takes out, or 1000 for each declaration (`Steps.worth`). -/
+  gain : Nat := 0
   deriving ToJson, FromJson, Inhabited
 
 structure Analysis where
@@ -255,17 +258,20 @@ private structure SourceEdit where
   start : String.Pos.Raw
   stop : String.Pos.Raw
   text : String
+  gain : Nat := 0
   deriving Inhabited
 
-private def SourceEdit.saving (e : SourceEdit) : Nat :=
-  e.stop.byteIdx - e.start.byteIdx - e.text.utf8ByteSize
+/-- What the edit is worth: the steps and declarations it takes out, then the UTF-8 bytes after
+    newline conversion. -/
+private def SourceEdit.saving (e : SourceEdit) : Int :=
+  Steps.worth e.gain ((e.stop.byteIdx - e.start.byteIdx : Int) - e.text.utf8ByteSize)
 
-/-- Weighted interval scheduling. Combining disjoint edits inside a proof can save more than
-    replacing the entire proof. Score actual UTF-8 bytes after newline conversion. -/
+/-- Weighted interval scheduling. Combining disjoint edits inside a proof can be worth more than
+    replacing the entire proof. -/
 private def smallestSource (edits : Array SourceEdit) : Array SourceEdit := Id.run do
   let sorted := (edits.filter (·.saving > 0)).qsort fun a b =>
     a.stop < b.stop || (a.stop == b.stop && (a.start < b.start || (a.start == b.start && a.text < b.text)))
-  let mut scores := #[0]
+  let mut scores : Array Int := #[0]
   let mut choices : Array (Option Nat) := #[]
   for h : i in [:sorted.size] do
     let e := sorted[i]
@@ -296,7 +302,7 @@ def rewrite (text : String) (fs : Array Finding) (shorter := false) : String × 
     let span := map.lspRangeToUtf8Range e.range
     let crlf := (lines[e.range.start.line]?.getD "").endsWith "\r"
     let new := if crlf then "\r\n".intercalate (e.newText.splitOn "\n") else e.newText
-    return { start := span.start, stop := span.stop, text := new : SourceEdit }
+    return { start := span.start, stop := span.stop, text := new, gain := f.gain : SourceEdit }
   let edits := if shorter then smallestSource edits else edits
   let mut out := ""
   let mut cursor : String.Pos.Raw := 0
@@ -460,7 +466,7 @@ structure Args where
   minSaving : Nat := 1
 
 def usage : String :=
-  "usage: leanperf --golf [--cosmetic] [--strip-comments] [--keep-unused] [--no-optimize] [--rounds N] [--jobs N] paths …\n" ++
+  "usage: leanperf --golf [--cosmetic] [--strip-comments] [--keep-unused] [--no-optimize] [--speed] [--rounds N] [--jobs N] paths …\n" ++
   "       leanperf [--lsp] [--rules R,…] [--apply] [--check] [--bench N] [--dedup] " ++
   "[--dedup-pass {auto,syntax,elaborate}] [--tactics] [--compress] [--cosmetic] [--unused] [--layout] [--propose CMD] " ++
   "[--min-saving N] [--jobs N] " ++
@@ -472,7 +478,8 @@ A Lean proof linter, batch rewriter and LSP server.
   --golf           every shrinking pass in order, each edit checked: --unused, --dedup, rounds of
                    --unused and --compress until nothing changes, then --tactics. With
                    --cosmetic also byte-only edits and --layout, --strip-comments first deletes
-                   comments, --keep-unused keeps theorems nothing uses, --no-optimize skips --tactics
+                   comments, --keep-unused keeps theorems nothing uses. --tactics, last, only
+                   takes cheaper tactics that add no bytes: --speed takes them all, --no-optimize none
   --lsp            serve LSP over stdio
   --list-lints     show the lint names, modes and descriptions
   --rules R,…      enable only these lints within the chosen mode
@@ -923,6 +930,7 @@ def golf (argv : List String) : IO UInt32 := do
   let mut strip := false
   let mut unused := true
   let mut optimize := true
+  let mut speed := false
   let mut rounds := 6
   let mut extra : Array String := #[]
   let mut paths : Array String := #[]
@@ -934,6 +942,7 @@ def golf (argv : List String) : IO UInt32 := do
     | "--strip-comments" => strip := true
     | "--keep-unused" => unused := false
     | "--no-optimize" => optimize := false
+    | "--speed" => speed := true
     | "--rounds" | "--jobs" =>
       let v :: r := rest | IO.eprintln s!"leanperf: error: {a} needs a value"; return 2
       rest := r
@@ -988,7 +997,8 @@ def golf (argv : List String) : IO UInt32 := do
     IO.println s!"round {i}: {u} unused, {c} compress and {l} layout edits, {← size} bytes"
     if u + c + l == 0 then break
   if optimize then
-    let (n, f) ← pass #["--tactics", "--apply", "--check"]
+    -- Cheaper tactics that add no bytes, unless speed matters more than size.
+    let (n, f) ← pass (#["--tactics", "--apply", "--check"] ++ (if speed then #[] else #["--shorter"]))
     failed := failed || f
     IO.println s!"cheaper tactics: {n} edits, {← size} bytes"
   IO.println s!"end: {describe (← counts) (← size)} (from {describe before bytes0})"

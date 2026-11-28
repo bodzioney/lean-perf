@@ -1,4 +1,5 @@
 import LeanPerf.Instances
+import LeanPerf.Steps
 
 /-!
 # Edits to one command, checked together
@@ -21,12 +22,17 @@ structure Edit where
   newText : String
   /-- The edit deletes instance binders, which changes the exported type by design. -/
   dropsInstances : Bool := false
+  /-- The steps the edit takes out, or 1000 for each declaration (see `Steps.worth`). -/
+  gain : Nat := 0
   deriving Inhabited
 
-private def saving (e : Edit) : Int := (e.range.stop.byteIdx - e.range.start.byteIdx : Int) - e.newText.utf8ByteSize
+/-- What the edit is worth: steps and declarations first, then bytes. -/
+private def saving (e : Edit) : Int :=
+  Steps.worth e.gain ((e.range.stop.byteIdx - e.range.start.byteIdx : Int) - e.newText.utf8ByteSize)
 
-/-- The edits the source rewrite applies: with `shorter`, a set of disjoint edits that saves the most
-    bytes; otherwise an edit unless an earlier one contains it. Returns indices in source order. -/
+/-- The edits the source rewrite applies: with `shorter`, a set of disjoint edits worth the most (steps
+    and declarations taken out, then bytes); otherwise an edit unless an earlier one contains it.
+    Returns indices in source order. -/
 def select (edits : Array Edit) (shorter : Bool) : Array Nat := Id.run do
   let idx := (Array.range edits.size).qsort fun i j =>
     let a := edits[i]!.range
@@ -40,7 +46,7 @@ def select (edits : Array Edit) (shorter : Bool) : Array Nat := Id.run do
         out := out.push i
         stop := edits[i]!.range.stop
     return out
-  -- Weighted interval scheduling by bytes saved.
+  -- Weighted interval scheduling by what the edits are worth.
   let byStop := (idx.filter (saving edits[·]! > 0)).qsort fun i j => edits[i]!.range.stop < edits[j]!.range.stop
   let mut best : Array Int := #[0]
   let mut prev : Array Nat := #[]
